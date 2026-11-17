@@ -1,0 +1,527 @@
+{
+  "comparison": "same process, alternating order, identical native dependency and build flags",
+  "network_requests": 0,
+  "profile": "release",
+  "rows": [
+    {
+      "ast": {
+        "mean_us": 158500.93333333335,
+        "median_us": 151161.4,
+        "p95_us": 202040.4
+      },
+      "baseline": {
+        "mean_us": 128240.40666666668,
+        "median_us": 126898.5,
+        "p95_us": 135649.9
+      },
+      "bytes": 612691,
+      "iterations": 15,
+      "label": "fresh_full",
+      "median_change_percent": 19.11992655547543,
+      "mode": "key_then_version",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 106986.60666666667,
+        "median_us": 102969.6,
+        "p95_us": 133298.0
+      },
+      "baseline": {
+        "mean_us": 134329.39333333334,
+        "median_us": 132998.1,
+        "p95_us": 144283.4
+      },
+      "bytes": 612691,
+      "iterations": 15,
+      "label": "fresh_full",
+      "median_change_percent": -22.578142093759233,
+      "mode": "analyze_script",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 273.4266666666667,
+        "median_us": 255.7,
+        "p95_us": 455.4
+      },
+      "baseline": {
+        "mean_us": 134883.70666666667,
+        "median_us": 131440.2,
+        "p95_us": 158071.0
+      },
+      "bytes": 612691,
+      "iterations": 15,
+      "label": "fresh_full",
+      "median_change_percent": -99.80546286448134,
+      "mode": "sdk_hash_lookup",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 65765.90666666666,
+        "median_us": 64165.4,
+        "p95_us": 83865.9
+      },
+      "baseline": {
+        "mean_us": 123010.36,
+        "median_us": 123726.0,
+        "p95_us": 134097.7
+      },
+      "bytes": 636820,
+      "iterations": 15,
+      "label": "legacy_full",
+      "median_change_percent": -48.139113848342305,
+      "mode": "key_then_version",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 66938.98666666666,
+        "median_us": 65316.9,
+        "p95_us": 79863.5
+      },
+      "baseline": {
+        "mean_us": 122112.66666666667,
+        "median_us": 118775.7,
+        "p95_us": 152467.6
+      },
+      "bytes": 636820,
+      "iterations": 15,
+      "label": "legacy_full",
+      "median_change_percent": -45.00819612092373,
+      "mode": "analyze_script",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 270.3333333333333,
+        "median_us": 268.6,
+        "p95_us": 279.3
+      },
+      "baseline": {
+        "mean_us": 124200.08,
+        "median_us": 123187.7,
+        "p95_us": 132131.2
+      },
+      "bytes": 636820,
+      "iterations": 15,
+      "label": "legacy_full",
+      "median_change_percent": -99.7819587507519,
+      "mode": "sdk_hash_lookup",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 93.7745,
+        "median_us": 89.2,
+        "p95_us": 122.8
+      },
+      "baseline": {
+        "mean_us": 90.4195,
+        "median_us": 85.5,
+        "p95_us": 129.6
+      },
+      "bytes": 981,
+      "iterations": 200,
+      "label": "homedepot_version_delta.js",
+      "median_change_percent": 4.327485380116958,
+      "mode": "key_then_version",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 82.8415,
+        "median_us": 75.4,
+        "p95_us": 124.7
+      },
+      "baseline": {
+        "mean_us": 109.5385,
+        "median_us": 97.3,
+        "p95_us": 167.3
+      },
+      "bytes": 981,
+      "iterations": 200,
+      "label": "homedepot_version_delta.js",
+      "median_change_percent": -22.507708119218904,
+      "mode": "analyze_script",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 0.868,
+        "median_us": 0.8,
+        "p95_us": 1.2
+      },
+      "baseline": {
+        "mean_us": 89.9915,
+        "median_us": 85.0,
+        "p95_us": 134.2
+      },
+      "bytes": 981,
+      "iterations": 200,
+      "label": "homedepot_version_delta.js",
+      "median_change_percent": -99.05882352941177,
+      "mode": "sdk_hash_lookup",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 122.245,
+        "median_us": 116.1,
+        "p95_us": 179.2
+      },
+      "baseline": {
+        "mean_us": 133.078,
+        "median_us": 125.6,
+        "p95_us": 187.3
+      },
+      "bytes": 984,
+      "iterations": 200,
+      "label": "homedepot_fresh_return_delta.js",
+      "median_change_percent": -7.563694267515919,
+      "mode": "key_then_version",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 106.1345,
+        "median_us": 94.9,
+        "p95_us": 149.2
+      },
+      "baseline": {
+        "mean_us": 155.712,
+        "median_us": 138.3,
+        "p95_us": 221.7
+      },
+      "bytes": 984,
+      "iterations": 200,
+      "label": "homedepot_fresh_return_delta.js",
+      "median_change_percent": -31.381055676066527,
+      "mode": "analyze_script",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 0.9465,
+        "median_us": 0.9,
+        "p95_us": 1.2
+      },
+      "baseline": {
+        "mean_us": 139.1135,
+        "median_us": 116.2,
+        "p95_us": 181.0
+      },
+      "bytes": 984,
+      "iterations": 200,
+      "label": "homedepot_fresh_return_delta.js",
+      "median_change_percent": -99.22547332185886,
+      "mode": "sdk_hash_lookup",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 33.495,
+        "median_us": 31.9,
+        "p95_us": 46.9
+      },
+      "baseline": {
+        "mean_us": 30.9325,
+        "median_us": 29.3,
+        "p95_us": 43.3
+      },
+      "bytes": 342,
+      "iterations": 200,
+      "label": "homedepot_491_split_numeric.js",
+      "median_change_percent": 8.87372013651877,
+      "mode": "key_then_version",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 37.9045,
+        "median_us": 39.6,
+        "p95_us": 51.1
+      },
+      "baseline": {
+        "mean_us": 44.4575,
+        "median_us": 48.1,
+        "p95_us": 58.9
+      },
+      "bytes": 342,
+      "iterations": 200,
+      "label": "homedepot_491_split_numeric.js",
+      "median_change_percent": -17.671517671517666,
+      "mode": "analyze_script",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 0.637,
+        "median_us": 0.6,
+        "p95_us": 0.9
+      },
+      "baseline": {
+        "mean_us": 36.735,
+        "median_us": 30.4,
+        "p95_us": 51.8
+      },
+      "bytes": 342,
+      "iterations": 200,
+      "label": "homedepot_491_split_numeric.js",
+      "median_change_percent": -98.02631578947368,
+      "mode": "sdk_hash_lookup",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 31.863,
+        "median_us": 26.6,
+        "p95_us": 55.2
+      },
+      "baseline": {
+        "mean_us": 27.6965,
+        "median_us": 23.3,
+        "p95_us": 43.2
+      },
+      "bytes": 386,
+      "iterations": 200,
+      "label": "homedepot_5d7_short_registration.js",
+      "median_change_percent": 14.163090128755362,
+      "mode": "key_then_version",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 22.416,
+        "median_us": 21.6,
+        "p95_us": 25.4
+      },
+      "baseline": {
+        "mean_us": 24.968,
+        "median_us": 23.8,
+        "p95_us": 32.5
+      },
+      "bytes": 386,
+      "iterations": 200,
+      "label": "homedepot_5d7_short_registration.js",
+      "median_change_percent": -9.243697478991598,
+      "mode": "analyze_script",
+      "outputs_match": true
+    },
+    {
+      "ast": {
+        "mean_us": 0.6315,
+        "median_us": 0.6,
+        "p95_us": 1.0
+      },
+      "baseline": {
+        "mean_us": 27.2855,
+        "median_us": 24.2,
+        "p95_us": 41.3
+      },
+      "bytes": 386,
+      "iterations": 200,
+      "label": "homedepot_5d7_short_registration.js",
+      "median_change_percent": -97.52066115702479,
+      "mode": "sdk_hash_lookup",
+      "outputs_match": true
+    }
+  ],
+  "baseline": {
+    "description": "85-test pre-AST local implementation, b1e4621 plus uncommitted review fixes",
+    "head": "b1e46212bd220bedfc09f8f931db6e1cc19efe4d",
+    "working_diff_sha256": "1d39f4219cbe447440b3c36bb53f60d97e5e6c492753377fc9caeeab186410e5",
+    "source_snapshot_preserved_locally": true
+  },
+  "environment": {
+    "rust": "1.98.1",
+    "target": "x86_64-pc-windows-msvc",
+    "profile": "release",
+    "warmup_per_mode": 1,
+    "baseline_package_name_only_changed_for_side_by_side_linking": true,
+    "native_dependency_and_sha_features_identical": true,
+    "memory_not_measured": true
+  },
+  "version_route_proven_offline": {
+    "fresh_full": "XOR fallback, delta recognizer returns None; default 25000000 work budget completes",
+    "legacy_full": "exact-source legacy delta compatibility"
+  },
+  "span_index_comparison": {
+    "comparison": "same process, alternating order, identical native dependency and build flags",
+    "network_requests": 0,
+    "profile": "release",
+    "rows": [
+      {
+        "ast": {
+          "mean_us": 5023.986666666667,
+          "median_us": 4630.5,
+          "p95_us": 7162.2
+        },
+        "baseline": {
+          "mean_us": 5761.753333333333,
+          "median_us": 5184.5,
+          "p95_us": 8197.5
+        },
+        "bytes": 16876,
+        "iterations": 15,
+        "label": "nested_pairs_depth48_reads8192",
+        "median_change_percent": -10.685697752917346,
+        "mode": "key_then_version",
+        "outputs_match": true
+      },
+      {
+        "ast": {
+          "mean_us": 3454.4933333333333,
+          "median_us": 3431.9,
+          "p95_us": 3820.3
+        },
+        "baseline": {
+          "mean_us": 3865.68,
+          "median_us": 3784.5,
+          "p95_us": 4377.9
+        },
+        "bytes": 16876,
+        "iterations": 15,
+        "label": "nested_pairs_depth48_reads8192",
+        "median_change_percent": -9.316950720042271,
+        "mode": "analyze_script",
+        "outputs_match": true
+      },
+      {
+        "ast": {
+          "mean_us": 8.02,
+          "median_us": 8.0,
+          "p95_us": 9.8
+        },
+        "baseline": {
+          "mean_us": 3605.52,
+          "median_us": 3612.8,
+          "p95_us": 3974.4
+        },
+        "bytes": 16876,
+        "iterations": 15,
+        "label": "nested_pairs_depth48_reads8192",
+        "median_change_percent": -99.77856510186005,
+        "mode": "sdk_hash_lookup",
+        "outputs_match": true
+      },
+      {
+        "ast": {
+          "mean_us": 17710.166666666668,
+          "median_us": 17568.0,
+          "p95_us": 20149.4
+        },
+        "baseline": {
+          "mean_us": 20197.986666666668,
+          "median_us": 20162.5,
+          "p95_us": 21294.5
+        },
+        "bytes": 66220,
+        "iterations": 15,
+        "label": "nested_pairs_depth96_reads32768",
+        "median_change_percent": -12.867947923124612,
+        "mode": "key_then_version",
+        "outputs_match": true
+      },
+      {
+        "ast": {
+          "mean_us": 11519.633333333333,
+          "median_us": 10999.0,
+          "p95_us": 13251.9
+        },
+        "baseline": {
+          "mean_us": 15345.606666666667,
+          "median_us": 15170.2,
+          "p95_us": 17303.1
+        },
+        "bytes": 66220,
+        "iterations": 15,
+        "label": "nested_pairs_depth96_reads32768",
+        "median_change_percent": -27.496011918102603,
+        "mode": "analyze_script",
+        "outputs_match": true
+      },
+      {
+        "ast": {
+          "mean_us": 30.226666666666667,
+          "median_us": 28.7,
+          "p95_us": 41.5
+        },
+        "baseline": {
+          "mean_us": 15020.966666666665,
+          "median_us": 14963.2,
+          "p95_us": 16466.2
+        },
+        "bytes": 66220,
+        "iterations": 15,
+        "label": "nested_pairs_depth96_reads32768",
+        "median_change_percent": -99.80819610778443,
+        "mode": "sdk_hash_lookup",
+        "outputs_match": true
+      },
+      {
+        "ast": {
+          "mean_us": 5806.053333333333,
+          "median_us": 5845.4,
+          "p95_us": 6791.3
+        },
+        "baseline": {
+          "mean_us": 8626.586666666666,
+          "median_us": 8737.4,
+          "p95_us": 9553.5
+        },
+        "bytes": 20853,
+        "iterations": 15,
+        "label": "annex_reads8192_initializers512",
+        "median_change_percent": -33.09909126284707,
+        "mode": "key_then_version",
+        "outputs_match": true
+      },
+      {
+        "ast": {
+          "mean_us": 3158.0333333333333,
+          "median_us": 3139.5,
+          "p95_us": 3584.6
+        },
+        "baseline": {
+          "mean_us": 6148.186666666667,
+          "median_us": 6117.3,
+          "p95_us": 6728.3
+        },
+        "bytes": 20853,
+        "iterations": 15,
+        "label": "annex_reads8192_initializers512",
+        "median_change_percent": -48.67833848266392,
+        "mode": "analyze_script",
+        "outputs_match": true
+      },
+      {
+        "ast": {
+          "mean_us": 9.586666666666666,
+          "median_us": 9.3,
+          "p95_us": 11.9
+        },
+        "baseline": {
+          "mean_us": 6080.993333333333,
+          "median_us": 5910.1,
+          "p95_us": 6808.6
+        },
+        "bytes": 20853,
+        "iterations": 15,
+        "label": "annex_reads8192_initializers512",
+        "median_change_percent": -99.8426422564762,
+        "mode": "sdk_hash_lookup",
+        "outputs_match": true
+      }
+    ],
+    "baseline": {
+      "description": "AST implementation before read-position, anchor-search, dispatcher-scan and initializer-fact optimizations",
+      "source_sha256": {
+        "ast_scope.rs": "ab22c5025e32b3572acdd8dee1b6ad804706245561403881d80a8104180b5902",
+        "numeric_tables.rs": "130ae24ba7b9bcda826fc21748f3fcaefffe3e20910fc0c94ab8d4b28117ed88",
+        "delta_version.rs": "ea724890e03590468b89196fe9ddcf5c46e8777f4c88bfa2ebc0b19599065354"
+      }
+    }
+  }
+}

@@ -2,46 +2,151 @@
 //! to a key initializer used as the second member of a cipher-key pair.
 //! This recognizer never executes a source function or guesses a numeric key.
 use super::verified_legacy_layout;
-use super::{bind_numeric_anchor, decode_numeric_key, literal_arrays, numeric_constants};
+use super::{
+    ast_scope::{Analysis, Numbers},
+    bind_numeric_anchor, decode_numeric_key, literal_arrays,
+};
 use native_payload::template::parse_js_string_array;
+use oxc_syntax::symbol::SymbolId;
 use std::collections::{BTreeMap, BTreeSet};
-fn number(s: &str, constants: &BTreeMap<String, i64>) -> Option<usize> {
-    s.parse::<usize>()
-        .ok()
+// Charge worst-case glyph-slot visits and map copies, not just loop counts.
+const NUMERIC_MAP_WORK_BUDGET: usize = 25_000_000;
+const NUMERIC_MAP_LIMIT: usize = 256;
+fn digit_maps<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    mut remaining: usize,
+) -> Option<BTreeSet<[u8; 256]>> {
+    let values: BTreeSet<_> = values.into_iter().collect();
+    let mut maps = BTreeSet::from([[255; 256]]);
+    for expected in [
+        b"4294967295.000000".as_slice(),
+        b"8388607.000000".as_slice(),
+        b"65535.000000".as_slice(),
+    ] {
+        let candidates: Vec<_> = values
+            .iter()
+            .copied()
+            .filter(|s| s.len() == expected.len())
+            .collect();
+        let mut next = BTreeSet::new();
+        for map in &maps {
+            for encoded in &candidates {
+                remaining = remaining.checked_sub(256 + encoded.len() * 256)?;
+                if let Some(bound) = bind_numeric_anchor(map, encoded, expected) {
+                    next.insert(bound);
+                    if next.len() > NUMERIC_MAP_LIMIT {
+                        return None;
+                    }
+                }
+            }
+        }
+        maps = next;
+        if maps.is_empty() {
+            break;
+        }
+    }
+    let powers: Vec<_> = values
+        .iter()
+        .copied()
+        .filter(|s| (3..=6).contains(&s.len()) && s.is_ascii())
+        .collect();
+    let mut completed = BTreeSet::new();
+    for mut map in maps {
+        let mut ones = BTreeSet::new();
+        for s in &powers {
+            remaining = remaining.checked_sub(1 + s.len())?;
+            let bytes = s.as_bytes();
+            if map[bytes[0] as usize] == 255 && bytes[1..].iter().all(|c| map[*c as usize] == 0) {
+                ones.insert(bytes[0]);
+            }
+        }
+        if ones.len() == 1 {
+            map[*ones.first().unwrap() as usize] = 1;
+        }
+        completed.insert(map);
+    }
+    Some(completed)
+}
+fn number(s: &str, constants: &Numbers) -> Option<usize> {
+    literal_arrays::decimal_integer(s)
+        .and_then(|n| usize::try_from(n).ok())
         .or_else(|| usize::try_from(*constants.get(s)?).ok())
 }
 // Validate the complete value-producing initializer, not merely a lookup
 // operand somewhere inside it. Unknown calls and arithmetic are not transparent.
-fn preserving_lookup(
+const LOOKUP_PLAN_WORK_BUDGET: usize = 2_000_000;
+struct PlanWork {
+    remaining: usize,
+    exhausted: bool,
+}
+impl PlanWork {
+    fn charge(&mut self, count: usize) -> Option<()> {
+        if let Some(remaining) = self.remaining.checked_sub(count) {
+            self.remaining = remaining;
+            Some(())
+        } else {
+            self.exhausted = true;
+            None
+        }
+    }
+}
+type DecodedValues = BTreeMap<(usize, usize), Option<u32>>;
+fn decode_cached(encoded: &str, map: &[u8; 256], values: &mut DecodedValues) -> Option<u32> {
+    // Identity keys avoid hashing/comparing the bytes of a large leaf again.
+    *values
+        .entry((encoded.as_ptr() as usize, encoded.len()))
+        .or_insert_with(|| decode_numeric_key(encoded, map))
+}
+enum LookupPlan<'a> {
+    Encoded(&'a str),
+    Equal(Box<LookupPlan<'a>>, Box<LookupPlan<'a>>),
+}
+impl LookupPlan<'_> {
+    fn decode(&self, map: &[u8; 256], values: &mut DecodedValues) -> Option<u32> {
+        match self {
+            Self::Encoded(encoded) => decode_cached(encoded, map, values),
+            Self::Equal(a, b) => {
+                let a = a.decode(map, values)?;
+                let b = b.decode(map, values)?;
+                (a == b).then_some(a)
+            }
+        }
+    }
+}
+fn compile_lookup_plan<'a>(
     t: &[&str],
-    pools: &BTreeMap<&str, &Vec<String>>,
-    constants: &BTreeMap<String, i64>,
-    map: &[u8; 256],
+    pools: &BTreeMap<SymbolId, &'a Vec<String>>,
+    constants: &Numbers,
+    ast: &Analysis,
     depth: usize,
-) -> Option<u32> {
+    work: &mut PlanWork,
+) -> Option<LookupPlan<'a>> {
+    work.charge(t.len())?;
     if depth > 32 {
         return None;
     }
-    let mut t = t;
-    while t.first() == Some(&"(") && t.last() == Some(&")") {
-        let mut level = 0i32;
-        let mut whole = true;
-        for (i, token) in t.iter().enumerate() {
-            match *token {
-                "(" => level += 1,
-                ")" => level -= 1,
-                _ => {}
+    // Pair parentheses once instead of rescanning the shrinking slice.
+    let mut closes = vec![usize::MAX; t.len()];
+    let mut opens = Vec::new();
+    for (index, token) in t.iter().enumerate() {
+        match *token {
+            "(" => opens.push(index),
+            ")" => {
+                let open = opens.pop()?;
+                closes[open] = index;
             }
-            if level == 0 && i + 1 < t.len() {
-                whole = false;
-                break;
-            }
+            _ => {}
         }
-        if !whole {
-            break;
-        }
-        t = &t[1..t.len() - 1];
     }
+    if !opens.is_empty() {
+        return None;
+    }
+    let (mut start, mut end) = (0, t.len());
+    while start < end && t[start] == "(" && closes[start] == end - 1 {
+        start += 1;
+        end -= 1;
+    }
+    let t = &t[start..end];
     let mut level = 0i32;
     let mut question = None;
     for (i, token) in t.iter().enumerate() {
@@ -60,14 +165,17 @@ fn preserving_lookup(
                 if q != 1 {
                     return None;
                 }
-                let a = preserving_lookup(&t[q + 1..i], pools, constants, map, depth + 1)?;
-                let b = preserving_lookup(&t[i + 1..], pools, constants, map, depth + 1)?;
-                return (a == b).then_some(a);
+                let a = compile_lookup_plan(&t[q + 1..i], pools, constants, ast, depth + 1, work)?;
+                let b = compile_lookup_plan(&t[i + 1..], pools, constants, ast, depth + 1, work)?;
+                return Some(LookupPlan::Equal(Box::new(a), Box::new(b)));
             }
             _ => {}
         }
     }
     if t.len() >= 4 && t[..2] == ["parseInt", "("] && t.last() == Some(&")") {
+        if !ast.builtin(t[0], "parseInt") {
+            return None;
+        }
         let args = &t[2..t.len() - 1];
         let lookup = if args.len() == 6 && args[4..] == [",", "10"] {
             &args[..4]
@@ -78,12 +186,25 @@ fn preserving_lookup(
         if lookup.len() != 4 {
             return None;
         }
-        return preserving_lookup(lookup, pools, constants, map, depth + 1);
+        return compile_lookup_plan(lookup, pools, constants, ast, depth + 1, work);
     }
     if t.len() != 4 || t[1] != "[" || t[3] != "]" {
         return None;
     }
-    decode_numeric_key(pools.get(t[0])?.get(number(t[2], constants)?)?, map)
+    if !ast.available(t[0]) {
+        return None;
+    }
+    let pool = *pools.get(&ast.symbol(t[0])?)?;
+    Some(LookupPlan::Encoded(
+        pool.get(number(t[2], constants)?)?.as_str(),
+    ))
+}
+struct PreparedKeyInitializer<'a> {
+    plan: Option<LookupPlan<'a>>,
+    reads_pool: bool,
+    invalid_binding: bool,
+    unsafe_pool: bool,
+    lookup_operands: Vec<&'a str>,
 }
 // A bounded compatibility route for the independently verified legacy loopback
 // script. Unknown changes must not turn an opaque initializer into a trusted
@@ -117,84 +238,227 @@ pub(super) fn extract_shuffle_key(source: &str) -> Option<u32> {
     analyze(source).key
 }
 pub(super) fn analyze(source: &str) -> Extraction {
+    analyze_with_analysis(source, None)
+}
+pub(super) fn analyze_with_analysis(source: &str, provided: Option<&Analysis>) -> Extraction {
+    analyze_with_budget(source, provided, NUMERIC_MAP_WORK_BUDGET)
+}
+fn analyze_with_budget(source: &str, provided: Option<&Analysis>, map_work: usize) -> Extraction {
+    analyze_with_limits(source, provided, map_work, LOOKUP_PLAN_WORK_BUDGET)
+}
+fn analyze_with_limits(
+    source: &str,
+    provided: Option<&Analysis>,
+    map_work: usize,
+    plan_work: usize,
+) -> Extraction {
+    let allow_legacy = verified_legacy_layout(source);
+    let owned = if !allow_legacy && provided.is_none() {
+        Analysis::parse(source)
+    } else {
+        None
+    };
+    let analysis = if allow_legacy {
+        None
+    } else {
+        provided.or(owned.as_ref())
+    };
+    if !allow_legacy && analysis.as_ref().is_none_or(|a| a.dynamic) {
+        return Extraction {
+            key: None,
+            method: "invalid_or_dynamic_javascript",
+            candidates: BTreeMap::new(),
+        };
+    }
+    let empty = Numbers::default();
+    let constants = analysis.as_ref().map_or(&empty, |a| &a.numbers);
     let t = literal_arrays::tokens(source);
-    let constants = numeric_constants::integer_constants(&t);
-    // Seed/flag helpers used in unrelated two-element arrays are not key
-    // decoders. Their operand must not be mistaken for the helper's result.
-    let unary_helpers: BTreeSet<_> = t
-        .windows(12)
-        .filter(|w| {
-            w[1..4] == ["=", "function", "("]
-                && w[5..8] == [")", "{", "return"]
-                && matches!(w[8], "-" | "!" | "~")
-                && w[9] == w[4]
-                && w[10..12] == [";", "}"]
-        })
-        .map(|w| w[0])
-        .collect();
-    let arrays: Vec<_> = literal_arrays::string_arrays(source)
-        .into_iter()
-        .map(|s| {
-            (
-                s.as_ptr() as usize - source.as_ptr() as usize,
-                parse_js_string_array(s),
-            )
-        })
-        .collect();
-    let all: Vec<_> = arrays.iter().flat_map(|(_, a)| a.iter()).collect();
-    let mut maps = BTreeSet::new();
+    let legacy_arrays: Vec<_> = if allow_legacy {
+        literal_arrays::string_arrays(source)
+            .into_iter()
+            .map(|s| {
+                (
+                    s.as_ptr() as usize - source.as_ptr() as usize,
+                    parse_js_string_array(s),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let arrays = analysis
+        .as_ref()
+        .map_or(legacy_arrays.as_slice(), |a| a.string_arrays.as_slice());
+    let Some(maps) = digit_maps(
+        arrays
+            .iter()
+            .flat_map(|(_, values)| values.iter().map(String::as_str)),
+        map_work,
+    ) else {
+        return Extraction {
+            key: None,
+            method: "numeric_map_budget_exhausted",
+            candidates: BTreeMap::new(),
+        };
+    };
+    if maps.is_empty() {
+        return Extraction {
+            key: None,
+            method: "no_supported_numeric_layout",
+            candidates: BTreeMap::new(),
+        };
+    }
     let mut unsupported_bound_lookup = false;
     let mut unsupported_lookup_values = BTreeSet::new();
-    for a in all.iter().filter(|s| s.len() == 17) {
-        let Some(m32) = bind_numeric_anchor(&[255; 256], a, b"4294967295.000000") else {
-            continue;
-        };
-        for b in all.iter().filter(|s| s.len() == 14) {
-            let Some(m23) = bind_numeric_anchor(&m32, b, b"8388607.000000") else {
-                continue;
-            };
-            for c in all.iter().filter(|s| s.len() == 12) {
-                let Some(mut map) = bind_numeric_anchor(&m23, c, b"65535.000000") else {
-                    continue;
-                };
-                let ones: BTreeSet<_> = all
-                    .iter()
-                    .filter_map(|s| {
-                        let b = s.as_bytes();
-                        (s.is_ascii()
-                            && (3..=6).contains(&b.len())
-                            && map[b[0] as usize] == 255
-                            && b[1..].iter().all(|c| map[*c as usize] == 0))
-                        .then(|| b[0])
-                    })
-                    .collect();
-                if ones.len() == 1 {
-                    map[*ones.first().unwrap() as usize] = 1;
-                }
-                maps.insert(map);
-            }
-        }
-    }
-    let key_pair_variables: BTreeSet<_> = t
-        .windows(5)
-        .filter(|w| w[0] == "[" && w[2] == "," && w[4] == "]")
-        .map(|w| w[3])
+    let key_pair_variables: BTreeSet<_> = analysis
+        .as_ref()
+        .into_iter()
+        .flat_map(|a| a.key_pairs.iter().map(|p| p.0))
+        .collect();
+    let unavailable_pairs: BTreeSet<_> = analysis
+        .as_ref()
+        .into_iter()
+        .flat_map(|a| a.key_pairs.iter().filter(|p| !p.1).map(|p| p.0))
         .collect();
     let mut candidates = BTreeSet::new();
     let mut sentinel_candidates = BTreeSet::new();
     let mut registered_candidates = BTreeSet::new();
     let mut malformed_registration = false;
+    let mut unsafe_pool = false;
+    let mut unsafe_key = false;
     let mut legacy_candidates = BTreeSet::new();
-    let allow_legacy = verified_legacy_layout(source);
+    // Pool ownership/provenance is independent of the candidate digit map.
+    // Build its sorted read index once; nested evidence spans use binary search.
+    let pool_facts = analysis.as_ref().map(|ast| {
+        let arrays_by_offset: BTreeMap<_, _> = arrays
+            .iter()
+            .map(|(offset, values)| (*offset, values))
+            .collect();
+        let mut pools = BTreeMap::new();
+        let mut unsafe_owners = BTreeSet::new();
+        for (id, offset) in &ast.pool_owners {
+            if let Some(array) = arrays_by_offset.get(offset) {
+                if !ast.pool_intact_symbol(*id) {
+                    unsafe_owners.insert(*id);
+                }
+                pools.insert(*id, *array);
+            }
+        }
+        let read_positions = ast.derived_read_positions(pools.keys().copied());
+        let unproven_pool_read = ast
+            .unproven_key_writes
+            .iter()
+            .any(|span| Analysis::has_indexed_read(&read_positions, *span));
+        (pools, unsafe_owners, read_positions, unproven_pool_read)
+    });
+    unsupported_bound_lookup |= pool_facts.as_ref().is_some_and(|facts| facts.3);
+    // Tokenization, binding/poison checks and pool reads do not depend on the
+    // candidate digit mapping. Prepare them once before decoding candidates.
+    let mut prepared_initializers = Vec::new();
+    let mut work = PlanWork {
+        remaining: plan_work,
+        exhausted: false,
+    };
+    if let (Some(ast), Some((pools, unsafe_owners, read_positions, _))) =
+        (analysis.as_ref(), pool_facts.as_ref())
+    {
+        for initializer in &ast.initializers {
+            if !key_pair_variables.contains(&initializer.symbol) || initializer.callable {
+                continue;
+            }
+            let var = &source[initializer.binding.start as usize..initializer.binding.end as usize];
+            let reads_pool = Analysis::has_indexed_read(read_positions, initializer.expression);
+            if initializer.seed_operator {
+                unsupported_bound_lookup |= reads_pool;
+                continue;
+            }
+            let source_expression =
+                &source[initializer.expression.start as usize..initializer.expression.end as usize];
+            // Charge before tokenization. The temporary RHS tokens are dropped
+            // after compiling a plan; nested spans never retain duplicate views.
+            if work.charge(source_expression.len()).is_none() {
+                break;
+            }
+            let expression_tokens = literal_arrays::tokens(source_expression);
+            let expression = expression_tokens.as_slice();
+            if expression
+                .first()
+                .is_some_and(|token| ast.unary_seed(token))
+            {
+                unsupported_bound_lookup |= reads_pool;
+                continue;
+            }
+            if work.charge(expression.len()).is_none() {
+                break;
+            }
+            unsafe_key |= ast.poisoned_in(initializer.expression);
+            let invalid_binding = !ast.stable(var)
+                || ast
+                    .symbol(var)
+                    .is_some_and(|id| unavailable_pairs.contains(&id));
+            let unsafe_pool = expression.windows(2).any(|w| {
+                w[1] == "["
+                    && ast
+                        .symbol(w[0])
+                        .is_some_and(|id| unsafe_owners.contains(&id))
+            });
+            let lookup_operands = expression
+                .windows(4)
+                .filter_map(|w| {
+                    if w[1] != "[" || w[3] != "]" {
+                        return None;
+                    }
+                    pools
+                        .get(&ast.symbol(w[0])?)
+                        .and_then(|pool| number(w[2], constants).and_then(|index| pool.get(index)))
+                        .map(String::as_str)
+                })
+                .collect();
+            let plan = if initializer.simple {
+                compile_lookup_plan(expression, pools, constants, ast, 0, &mut work)
+            } else {
+                None
+            };
+            if work.exhausted {
+                break;
+            }
+            prepared_initializers.push(PreparedKeyInitializer {
+                plan,
+                reads_pool,
+                invalid_binding,
+                unsafe_pool,
+                lookup_operands,
+            });
+        }
+    }
+    if work.exhausted {
+        return Extraction {
+            key: None,
+            method: "initializer_plan_budget_exhausted",
+            candidates: BTreeMap::new(),
+        };
+    }
     for map in maps {
-        for (offset, a) in &arrays {
+        let mut decoded_values = DecodedValues::new();
+        for (offset, a) in arrays {
             // Lazy numeric-getter registration layout observed in the fresh
             // HomeDepot build: [u32_max, LCG multiplier, mask, build key, ...].
             // Its unrelated 8888888 sentinel is in another mathematical pool.
-            let invocation = t
-                .iter()
-                .position(|token| token.as_ptr() as usize - source.as_ptr() as usize == *offset)
-                .is_some_and(|i| i >= 2 && t[i - 2] == "}" && t[i - 1] == "(");
+            let invocation = if allow_legacy {
+                let i = t.partition_point(|token| {
+                    (token.as_ptr() as usize - source.as_ptr() as usize) < *offset
+                });
+                i >= 2
+                    && t.get(i).is_some_and(|token| {
+                        token.as_ptr() as usize - source.as_ptr() as usize == *offset
+                    })
+                    && t[i - 2] == "}"
+                    && t[i - 1] == "("
+            } else {
+                analysis
+                    .as_ref()
+                    .is_some_and(|a| a.is_registered_array(*offset))
+            };
             if invocation
                 && a.iter()
                     .take(2)
@@ -237,83 +501,38 @@ pub(super) fn analyze(source: &str) -> Extraction {
                 }
             }
         }
-        let mut pools = BTreeMap::new();
-        for (offset, a) in &arrays {
-            let Some(i) = t
-                .iter()
-                .position(|token| token.as_ptr() as usize - source.as_ptr() as usize == *offset)
-            else {
-                continue;
-            };
-            // Supported literal pool or decoded-pool invocation: pool=decode(state,[[...],...]).
-            let owner = if i >= 2 && t[i - 1] == "=" {
-                Some(t[i - 2])
-            } else if i >= 7
-                && t[i - 1] == "["
-                && t[i - 2] == ","
-                && t[i - 4] == "("
-                && t[i - 6] == "="
-            {
-                Some(t[i - 7])
-            } else {
-                None
-            };
-            if let Some(owner) = owner {
-                pools.insert(owner, a);
-            }
-        }
-        for i in 0..t.len().saturating_sub(3) {
-            if t[i] != "var" || t[i + 2] != "=" || t[i + 3] == "function" {
-                continue;
-            }
-            let var = t[i + 1];
-            if matches!(t[i + 3], "-" | "!" | "~") || unary_helpers.contains(t[i + 3]) {
-                continue;
-            }
-            if !key_pair_variables.contains(var) {
-                continue;
-            }
-            let mut depth = 0i32;
-            let mut end = i + 3;
-            while end < t.len() {
-                match t[end] {
-                    "(" | "[" | "{" => depth += 1,
-                    ")" | "]" | "}" => depth -= 1,
-                    ";" if depth == 0 => break,
-                    _ => {}
-                }
-                if depth < 0 {
-                    break;
-                }
-                end += 1;
-            }
-            if end == t.len() || t[i + 3..end].contains(&"function") {
-                continue;
-            }
-            let expression = &t[i + 3..end];
-            if let Some(value) = preserving_lookup(expression, &pools, &constants, &map, 0) {
+        for initializer in &prepared_initializers {
+            let proven = initializer
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.decode(&map, &mut decoded_values));
+            if let Some(value) = proven {
+                unsafe_key |= initializer.invalid_binding;
+                unsafe_pool |= initializer.unsafe_pool;
                 candidates.insert(value);
-            } else if expression
-                .windows(2)
-                .any(|w| pools.contains_key(w[0]) && w[1] == "[")
-            {
+            } else if initializer.reads_pool {
                 unsupported_bound_lookup = true;
-                for w in expression.windows(4) {
-                    if w[1] == "[" && w[3] == "]" {
-                        if let Some(value) = pools
-                            .get(w[0])
-                            .and_then(|pool| number(w[2], &constants).and_then(|i| pool.get(i)))
-                            .and_then(|v| decode_numeric_key(v, &map))
-                        {
-                            unsupported_lookup_values.insert(value);
-                        }
+                for encoded in &initializer.lookup_operands {
+                    if let Some(value) = decode_cached(encoded, &map, &mut decoded_values) {
+                        unsupported_lookup_values.insert(value);
                     }
                 }
             }
         }
     }
-    let (key, method) = if malformed_registration {
+    let (key, method) = if unsafe_key {
+        (None, "mutable_key_binding")
+    } else if unsafe_pool {
+        (None, "mutable_or_aliased_pool")
+    } else if malformed_registration {
         (None, "malformed_registered_pool")
+    } else if registered_candidates.len() > 1 {
+        (None, "ambiguous_registered_pools")
+    } else if candidates.len() == 1
+        && registered_candidates.len() == 1
+        && candidates.first() != registered_candidates.first()
+    {
+        (None, "conflicting_extraction_strategies")
     } else if candidates.len() == 1 {
         (candidates.first().copied(), "unique_bound_initializer")
     } else if !candidates.is_empty() {
@@ -479,6 +698,23 @@ mod tests {
         }
     }
     #[test]
+    fn prefix_mutated_indexes_are_not_constants() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        for mutation in ["++index;", "--index;", "index++;", "index--;", "index%=7;"] {
+            let changed = source.replace("var shuffle=", &format!("{mutation}var shuffle="));
+            assert_eq!(extract_shuffle_key(&changed), None, "{mutation}");
+        }
+    }
+    #[test]
+    fn bound_initializer_cannot_override_conflicting_registrations() {
+        let source = include_str!("fixtures/homedepot_5d7_short_registration.js");
+        let other = source.replace("NINSUtG", "NINSUtk");
+        let full = format!(
+            "{source}\n{other}\nvar pool=['NINSUtG'];var key=parseInt(pool[0]);var pair=[session,key];"
+        );
+        assert_eq!(extract_shuffle_key(&full), None);
+    }
+    #[test]
     fn changed_legacy_sources_are_not_whitelisted() {
         assert!(!verified_legacy_layout("unknown source"));
         let source = include_str!("fixtures/homedepot_217_legacy_parameter_pool.js");
@@ -542,5 +778,577 @@ mod tests {
             extract_shuffle_key(&src.replace("dTT6TYR", "unknown")),
             None
         );
+    }
+
+    #[test]
+    fn unsupported_index_mutations_fail_closed() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        for mutation in [
+            "index&&=0;",
+            "index||=0;",
+            "index**=2;",
+            "index>>>=1;",
+            "[index]=[0];",
+            "for(index of [0]){}",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(
+                    &source.replace("var shuffle=", &format!("{mutation}var shuffle="))
+                ),
+                None,
+                "{mutation}"
+            );
+        }
+    }
+    #[test]
+    fn bound_key_must_agree_with_single_registered_key() {
+        let source = include_str!("fixtures/homedepot_5d7_short_registration.js");
+        assert_eq!(
+            extract_shuffle_key(&format!(
+                "{source}var pool=['NINSUtk'];var key=parseInt(pool[0]);var pair=[session,key];"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn mutable_or_aliased_pool_and_deep_index_write_are_unsupported() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        for mutation in [
+            "pool.reverse();",
+            "pool[1]=pool[0];",
+            "pool=[];",
+            "var alias=pool;alias.reverse();",
+            "function alter(p){p.reverse();}alter(pool);",
+            "function a(){function b(){function c(){index=0;}c();}b();}a();",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(
+                    &source.replace("var shuffle=", &format!("{mutation}var shuffle="))
+                ),
+                None,
+                "{mutation}"
+            );
+        }
+    }
+    #[test]
+    fn legacy_octal_pool_index_is_unsupported() {
+        let source = include_str!("fixtures/homedepot_436427_numeric.js");
+        assert_eq!(
+            extract_shuffle_key(&source.replace("nW[11]", "nW[011]")),
+            None
+        );
+    }
+
+    #[test]
+    fn key_indexes_must_resolve_in_their_actual_scope() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        let lookup = "var shuffle=parseInt(pool[index]);var keys=[session,shuffle];";
+        for wrapped in [
+            format!("function f(index){{{lookup}}}f(0);"),
+            format!("{{let index;{lookup}}}"),
+            format!("({{run(index){{{lookup}}}}}).run(0);"),
+            format!("(function(index){{{lookup}}})(0);"),
+        ] {
+            assert_eq!(
+                extract_shuffle_key(&source.replace(lookup, &wrapped)),
+                None,
+                "{wrapped}"
+            );
+        }
+    }
+    #[test]
+    fn key_binding_cannot_change_before_its_pair() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        for mutation in [
+            "shuffle=shuffle+1;",
+            "shuffle++;",
+            "shuffle=0;",
+            "[shuffle]=[0];",
+            "let shuffle;",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(&source.replace("var keys=", &format!("{mutation}var keys="))),
+                None,
+                "{mutation}"
+            );
+        }
+    }
+    #[test]
+    fn destructuring_loop_and_delete_pool_writes_are_unsupported() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        for mutation in [
+            "[pool[1]]=[pool[0]];",
+            "for(pool[1] of ['noise']){}",
+            "({a:pool[1]}={a:'noise'});",
+            "delete pool[1];",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(
+                    &source.replace("var shuffle=", &format!("{mutation}var shuffle="))
+                ),
+                None,
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn additional_destructuring_and_global_writes_are_unsupported() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        for mutation in [
+            "x=[index]=[0];",
+            "x=[pool[1]]=['noise'];",
+            "0?0:[index]=[0];",
+            "globalThis.index=0;",
+            "window['index']=0;",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(
+                    &source.replace("var shuffle=", &format!("{mutation}var shuffle="))
+                ),
+                None,
+                "{mutation}"
+            );
+        }
+        assert_eq!(
+            extract_shuffle_key(&source.replace("var keys=", "x=[shuffle]=[0];var keys=")),
+            None
+        );
+    }
+    #[test]
+    fn bare_arrow_and_reserved_method_parameters_shadow_indexes() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        let lookup = "var shuffle=parseInt(pool[index]);var keys=[session,shuffle];";
+        for body in [
+            format!("(index=>{{{lookup}}})(0);"),
+            format!("(index=>(function(){{{lookup}}})())(0);"),
+            format!("({{while(index){{{lookup}}}}}).while(0);"),
+            format!("class C{{while(index){{{lookup}}}}}new C().while(0);"),
+        ] {
+            assert_eq!(
+                extract_shuffle_key(&source.replace(lookup, &body)),
+                None,
+                "{body}"
+            );
+        }
+    }
+    #[test]
+    fn parse_int_requires_an_unmodified_builtin_binding() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        let lookup = "var shuffle=parseInt(pool[index]);var keys=[session,shuffle];";
+        for prefix in [
+            "var parseInt=function(s){return 0;};",
+            "function parseInt(){return 0;}",
+            "window['parseInt']=function(){return 0;};",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(&format!("{prefix}{source}")),
+                None,
+                "{prefix}"
+            );
+        }
+        assert_eq!(
+            extract_shuffle_key(&source.replace(
+                lookup,
+                &format!("function f(parseInt){{{lookup}}}f(function(){{return 0;}});")
+            )),
+            None
+        );
+        assert_eq!(
+            extract_shuffle_key(&format!(
+                "var parseInt=function(){{return 0;}};{}",
+                source.replace("parseInt(pool[index])", "pool[index]")
+            )),
+            Some(9_618_129)
+        );
+    }
+
+    #[test]
+    fn expression_arrows_operator_methods_and_with_cannot_supply_index_constants() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        let lookup = "var shuffle=parseInt(pool[index]);var keys=[session,shuffle];";
+        for body in [
+            format!("((index)=>(function(){{{lookup}}})())(0);"),
+            format!("0||{{while(index){{{lookup}}}}}.while(0);"),
+            format!("with({{index:0}}){{{lookup}}}"),
+            format!("with(o){{{lookup}}}"),
+        ] {
+            assert_eq!(
+                extract_shuffle_key(&source.replace(lookup, &body)),
+                None,
+                "{body}"
+            );
+        }
+    }
+    #[test]
+    fn parenthesized_loop_and_chained_prefix_property_targets_are_writes() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        for mutation in [
+            "for(globalThis.index of [0]){}",
+            "(globalThis.index)=0;",
+            "++(window.index);",
+            "--window.self.index;",
+            "++((window['index']));",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(
+                    &source.replace("var shuffle=", &format!("{mutation}var shuffle="))
+                ),
+                None,
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn ast_keeps_independent_bindings_with_the_same_spelling() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        for source in [
+            format!("function unrelated(index){{return index;}}{source}"),
+            format!("{{let index;}}{source}"),
+            format!("const other={{while(index){{return index;}}}};{source}"),
+            format!("function run(){{{source}window['index']=0;}}run();"),
+        ] {
+            assert_eq!(extract_shuffle_key(&source), Some(9_618_129));
+        }
+    }
+    #[test]
+    fn ast_resolves_escaped_names_and_escaped_builtin_property_writes() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        assert_eq!(
+            extract_shuffle_key(&source.replace("var index=", "var \\u0069ndex=")),
+            Some(9_618_129)
+        );
+        assert_eq!(
+            extract_shuffle_key(&format!(
+                "window['parse\\u0049nt']=function(){{return 0;}};{source}"
+            )),
+            None
+        );
+        assert_eq!(
+            extract_shuffle_key(&format!("{source}const broken = ;")),
+            None
+        );
+    }
+    #[test]
+    fn ast_numeric_bindings_follow_block_scope_and_iife_scope() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        assert_eq!(
+            extract_shuffle_key(&format!("(function(){{{source}}})();")),
+            Some(9_618_129)
+        );
+        assert_eq!(
+            extract_shuffle_key(
+                &source
+                    .replace("var index=+!![];", "{let index=1;")
+                    .replace("var decoy=", "}var decoy=")
+            ),
+            Some(9_618_129)
+        );
+    }
+
+    #[test]
+    fn ast_requires_initializers_before_values_are_consumed() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        assert_eq!(
+            extract_shuffle_key(
+                &(source.replace("var index=+!![];", "var index=late;") + "var late=1;")
+            ),
+            None
+        );
+        let pool = "var pool=decode(state,[[\"noise\", \"JbBmBvJ\"],[]]);";
+        assert!(source.contains(pool));
+        assert_eq!(
+            extract_shuffle_key(&(source.replace(pool, "") + pool)),
+            None
+        );
+        assert_eq!(
+            extract_shuffle_key(&source.replace(
+                "var shuffle=parseInt(pool[index]);var keys=[session,shuffle];",
+                "var keys=[session,shuffle];var shuffle=parseInt(pool[index]);"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn ast_cipher_key_pairs_are_arrays_not_computed_comma_indexes() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        let changed = source
+            .replace(
+                "var keys=[session,shuffle];",
+                "var other=buffer[session,shuffle];",
+            )
+            .replace("var decoy=", "// var decoy=");
+        assert_eq!(extract_shuffle_key(&changed), None);
+    }
+
+    #[test]
+    fn ast_key_declarators_include_comma_let_and_const_initializers() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        for changed in [
+            source.replace(";var shuffle=", ",shuffle="),
+            source.replace("var shuffle=", "let shuffle="),
+            source.replace("var shuffle=", "const shuffle="),
+        ] {
+            assert_eq!(extract_shuffle_key(&changed), Some(9_618_129));
+        }
+        assert_eq!(
+            extract_shuffle_key(&source.replace(
+                "var shuffle=parseInt(pool[index])",
+                "const shuffle=transform(pool[index])"
+            )),
+            None
+        );
+        assert_eq!(
+            extract_shuffle_key(&source.replace("var shuffle=", "const [shuffle]=")),
+            None
+        );
+    }
+    #[test]
+    fn ast_ignores_registration_text_inside_nested_templates() {
+        let source = include_str!("fixtures/homedepot_d9_split_numeric.js");
+        let decoy = r#"var s=`${`}(["sd$s$YUd$MZ666666","YMU$T","dTsMYUR"])`}`;"#;
+        assert_eq!(
+            extract_shuffle_key(&format!("{source}{decoy}")),
+            Some(2_330_368)
+        );
+    }
+    #[test]
+    fn ast_block_function_redeclarations_invalidate_builtin_assumptions() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        assert_eq!(
+            extract_shuffle_key(&format!("{{function parseInt(){{return 0;}}}}{source}")),
+            None
+        );
+        assert_eq!(
+            extract_shuffle_key(&source.replace("var index=+!![];", "if(0){var index=+!![];}")),
+            None
+        );
+        assert_eq!(
+            extract_shuffle_key(&source.replace("var index=+!![];", "if(0)var index=+!![];")),
+            None
+        );
+        assert_eq!(
+            extract_shuffle_key(&format!(
+                "\"use strict\";{{function parseInt(){{return 0;}}}}{source}"
+            )),
+            Some(9_618_129)
+        );
+    }
+    #[test]
+    fn ast_assigned_key_bindings_cannot_fall_back_to_sentinels() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        for binding in [
+            "var shuffle;shuffle=parseInt(pool[index]);",
+            "shuffle=parseInt(pool[index]);",
+            "var shuffle;[shuffle]=[parseInt(pool[index])];",
+        ] {
+            let changed = source.replace("var shuffle=parseInt(pool[index]);", binding);
+            assert_eq!(extract_shuffle_key(&changed), None, "{binding}");
+        }
+    }
+    #[test]
+    fn ast_negated_pool_key_cannot_fall_back_to_sentinel() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        assert_eq!(
+            extract_shuffle_key(&source.replace("shuffle=parseInt", "shuffle=-parseInt")),
+            None
+        );
+    }
+    #[test]
+    fn ast_pattern_defaults_and_loop_sources_block_weak_sentinels() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        for binding in [
+            "var [shuffle=parseInt(pool[index])]=[];",
+            "var {key:shuffle=parseInt(pool[index])}={};",
+            "var shuffle;[shuffle=parseInt(pool[index])]=[];",
+            "var shuffle;({shuffle=parseInt(pool[index])}={});",
+            "var shuffle;for(shuffle of [parseInt(pool[index])]);",
+            "for(var shuffle of [parseInt(pool[index])]);",
+            "var shuffle;for(shuffle in {[parseInt(pool[index])]:true});",
+            "for(var shuffle in {[parseInt(pool[index])]:true});",
+            "for(var [shuffle=parseInt(pool[index])] of [[]]);",
+            "var shuffle;for([shuffle=parseInt(pool[index])] of [[]]);",
+        ] {
+            let changed = source.replace("var shuffle=parseInt(pool[index]);", binding);
+            assert_eq!(extract_shuffle_key(&changed), None, "{binding}");
+        }
+    }
+    #[test]
+    fn ast_parameter_defaults_cannot_become_weak_sentinel_keys() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        let prefix = source
+            .replace("var shuffle=parseInt(pool[index]);", "")
+            .replace("var keys=[session,shuffle];", "");
+        for declaration in [
+            "function use(shuffle=parseInt(pool[index])){var keys=[session,shuffle];}use();",
+            "function use([shuffle=parseInt(pool[index])]=[]){var keys=[session,shuffle];}use();",
+            "var use=(shuffle=parseInt(pool[index]))=>{var keys=[session,shuffle];};use();",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(&format!("{prefix}{declaration}")),
+                None,
+                "{declaration}"
+            );
+        }
+    }
+    #[test]
+    fn ast_pool_dependencies_through_local_bindings_block_sentinels() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        for binding in [
+            "var alias=pool;var shuffle=parseInt(alias[index]);",
+            "var t=parseInt(pool[index]);var shuffle=t;",
+            "var t=parseInt(pool[index]);var shuffle;shuffle=t;",
+            "var alias;alias=pool;var shuffle=parseInt(alias[index]);",
+            "var a=parseInt(pool[index]);var b=a;var c=b;var shuffle=c;",
+            "var a,b; b=a; a=parseInt(pool[index]);var shuffle=b;",
+            "var [t=parseInt(pool[index])]=[];var shuffle=t;",
+            "var t;[t=parseInt(pool[index])]=[];var shuffle=t;",
+            "var t;for(t of [parseInt(pool[index])]);var shuffle=t;",
+            "function use(t=parseInt(pool[index])){var shuffle=t;var keys=[session,shuffle];}use();",
+        ] {
+            let changed = source.replace("var shuffle=parseInt(pool[index]);", binding);
+            assert_eq!(extract_shuffle_key(&changed), None, "{binding}");
+        }
+    }
+    #[test]
+    fn ast_dependency_closure_handles_cycles_and_independent_bindings() {
+        let source = include_str!("fixtures/homedepot_36bb_numeric.js");
+        let changed = format!("{source}var a,b;a=b;b=a;var pair=[session,a];");
+        assert_eq!(extract_shuffle_key(&changed), Some(6_731_889));
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        let changed =
+            format!("{source}function unrelated(){{var pool=[],t=pool;var pair=[session,t];}}");
+        assert_eq!(extract_shuffle_key(&changed), Some(9_618_129));
+    }
+    #[test]
+    fn ast_inline_and_wrapped_pair_values_cannot_use_weak_sentinels() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        let inline = source.replace(
+            "var shuffle=parseInt(pool[index]);var keys=[session,shuffle];",
+            "var keys=[session,parseInt(pool[index])];",
+        );
+        assert_eq!(extract_shuffle_key(&inline), None);
+        for pair in [
+            "[session,+shuffle]",
+            "[session,(0,shuffle)]",
+            "[session,shuffle|0]",
+            "[session,parseInt(pool[index])]",
+            "[getSession(),shuffle]",
+            "[session,...[shuffle]]",
+            "[session,{key:shuffle}]",
+        ] {
+            let changed = source.replace("[session,shuffle]", pair);
+            assert_eq!(extract_shuffle_key(&changed), None, "{pair}");
+        }
+    }
+    #[test]
+    fn ast_nested_pair_evidence_ignores_non_pool_reads() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js").replace(
+            "var shuffle=parseInt(pool[index]);var keys=[session,shuffle];",
+            "",
+        );
+        let mut nested = format!("function(){{{}}}", "a;".repeat(4096));
+        for _ in 0..48 {
+            nested = format!("[0,{nested}]");
+        }
+        let changed = format!("{source}var a;{nested};");
+        assert_eq!(extract_shuffle_key(&changed), Some(4096));
+    }
+    #[test]
+    fn duplicate_numeric_anchors_do_not_expand_search() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        let anchors = ["3vJ3JbHvJM7NNNNNN", "mrmmbNH7NNNNNN", "bMMrM7NNNNNN"];
+        let repeated: Vec<_> = anchors.iter().cycle().take(900).collect();
+        let changed = format!(
+            "{source}var repeated={};",
+            serde_json::to_string(&repeated).unwrap()
+        );
+        assert_eq!(extract_shuffle_key(&changed), Some(9_618_129));
+    }
+    #[test]
+    fn numeric_map_work_exhaustion_never_returns_a_partial_candidate() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        for budget in [0, 5000] {
+            let result = analyze_with_budget(source, None, budget);
+            assert_eq!(result.key, None);
+            assert_eq!(result.method, "numeric_map_budget_exhausted");
+        }
+        assert_eq!(extract_shuffle_key(source), Some(9_618_129));
+    }
+
+    #[test]
+    fn excessive_distinct_anchor_maps_fail_closed() {
+        let mut values: Vec<String> = (0..300)
+            .map(|n| {
+                "4294967295.000000"
+                    .chars()
+                    .map(|c| match c {
+                        '4' => char::from(b'A' + (n % 26) as u8),
+                        '2' => char::from(b'a' + (n / 26) as u8),
+                        other => other,
+                    })
+                    .collect()
+            })
+            .collect();
+        values.extend(["8388607.000000".into(), "65535.000000".into()]);
+        let source = format!("var values={};", serde_json::to_string(&values).unwrap());
+        let result = analyze(&source);
+        assert_eq!(result.key, None);
+        assert_eq!(result.method, "numeric_map_budget_exhausted");
+    }
+    #[test]
+    fn unrelated_annex_references_and_repeated_initializers_keep_valid_key() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        let changed = format!(
+            "{{function x(){{}}}}{}{source}{}var pair=[0,k];",
+            "x;".repeat(2048),
+            "var k=0;".repeat(256)
+        );
+        assert_eq!(extract_shuffle_key(&changed), Some(9_618_129));
+    }
+    #[test]
+    fn deeply_parenthesized_key_lookup_remains_supported() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        let expression = format!("{}parseInt(pool[index]){}", "(".repeat(64), ")".repeat(64));
+        assert_eq!(
+            extract_shuffle_key(&source.replace("parseInt(pool[index])", &expression)),
+            Some(9_618_129)
+        );
+    }
+    #[test]
+    fn nested_sequence_function_initializers_keep_bounded_plans() {
+        let mut nested = "0;".repeat(4096);
+        for _ in 0..12 {
+            nested = format!("var a=(0,function(){{{nested}}});var p=[0,a];");
+        }
+        assert_eq!(extract_shuffle_key(&nested), None);
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        assert_eq!(
+            extract_shuffle_key(&format!("{source}{nested}")),
+            Some(9_618_129)
+        );
+    }
+    #[test]
+    fn lookup_plan_budget_exhaustion_rejects_partial_results() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        let result = analyze_with_limits(source, None, NUMERIC_MAP_WORK_BUDGET, 0);
+        assert_eq!(result.key, None);
+        assert_eq!(result.method, "initializer_plan_budget_exhausted");
+        assert_eq!(extract_shuffle_key(source), Some(9_618_129));
+    }
+
+    #[test]
+    fn overlapping_initializer_work_hits_default_plan_limit() {
+        let mut nested = "0;".repeat(32768);
+        for _ in 0..40 {
+            nested = format!("var a=(0,function(){{{nested}}});var p=[0,a];");
+        }
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        let result = analyze(&format!("{source}{nested}"));
+        assert_eq!(result.key, None);
+        assert_eq!(result.method, "initializer_plan_budget_exhausted");
     }
 }

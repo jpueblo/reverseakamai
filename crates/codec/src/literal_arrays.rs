@@ -159,35 +159,15 @@ pub(super) fn tokens(source: &str) -> Vec<&str> {
             c => {
                 regex_allowed = !c.is_ascii_digit() && !matches!(c, b']' | b'.');
                 control_paren = false;
-                i += 1;
-                if i < bytes.len()
-                    && bytes[i].is_ascii()
-                    && matches!(
-                        &source[start..i + 1],
-                        "==" | "!="
-                            | "<="
-                            | ">="
-                            | "++"
-                            | "--"
-                            | "+="
-                            | "-="
-                            | "*="
-                            | "/="
-                            | "&&"
-                            | "||"
-                            | "<<"
-                            | ">>"
-                            | "=>"
-                    )
-                {
-                    i += 1;
-                    if i < bytes.len()
-                        && bytes[i] == b'='
-                        && matches!(&source[start..i], "==" | "!=")
-                    {
-                        i += 1;
-                    }
-                }
+                let operators = [
+                    ">>>=", "===", "!==", "**=", "&&=", "||=", "??=", "<<=", ">>=", ">>>", "==",
+                    "!=", "<=", ">=", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+                    "&&", "||", "??", "<<", ">>", "**", "=>",
+                ];
+                i += operators
+                    .iter()
+                    .find(|op| source[start..].starts_with(**op))
+                    .map_or(1, |op| op.len());
             }
         }
         if emit {
@@ -228,4 +208,111 @@ mod tests {
             vec!["['one', 'two',]"]
         );
     }
+}
+
+/// Retained solely for the immutable SHA256-gated legacy decoder.
+/// General JavaScript writes and scopes are handled by ast_scope.
+pub(super) fn legacy_mutation_indices(t: &[&str]) -> std::collections::BTreeSet<usize> {
+    let mut result = std::collections::BTreeSet::new();
+    for i in 0..t.len() {
+        if !t[i]
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'$')
+            || (i > 0 && t[i - 1] == ".")
+        {
+            continue;
+        }
+        let mut before = i;
+        while before > 0 && t[before - 1] == "(" {
+            before -= 1;
+        }
+        let mut after = i + 1;
+        while after < t.len() && t[after] == ")" {
+            after += 1;
+        }
+        let prefix = before > 0 && matches!(t[before - 1], "++" | "--");
+        let postfix = t.get(after).is_some_and(|op| {
+            matches!(*op, "++" | "--")
+                || (op.ends_with('=')
+                    && !matches!(*op, "=" | "==" | "===" | "!=" | "!==" | "<=" | ">=" | "=>"))
+        });
+        if prefix || postfix || matches!(t.get(i + 1), Some(&"in" | &"of")) {
+            result.insert(i);
+        }
+    }
+    let mut stack = Vec::new();
+    let mut pairs = Vec::new();
+    for (i, token) in t.iter().enumerate() {
+        match *token {
+            "[" | "{" | "(" => stack.push(i),
+            "]" | "}" | ")" => {
+                if let Some(open) = stack.pop() {
+                    pairs.push((open, i));
+                }
+            }
+            _ => {}
+        }
+    }
+    for (open, close) in pairs {
+        if !matches!(t[open], "[" | "{") || !matches!(t.get(close + 1), Some(&"=" | &"in" | &"of"))
+        {
+            continue;
+        }
+        // Only a preceding value operand makes this a computed member target.
+        // Assignment/conditional/return positions can start destructuring too.
+        if open > 0 {
+            let prev = t[open - 1];
+            let word = prev
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphabetic() || matches!(b, b'_' | b'$'));
+            let prefix = matches!(
+                prev,
+                "var"
+                    | "let"
+                    | "const"
+                    | "return"
+                    | "yield"
+                    | "await"
+                    | "throw"
+                    | "case"
+                    | "delete"
+                    | "void"
+                    | "typeof"
+                    | "new"
+                    | "else"
+                    | "in"
+                    | "of"
+            );
+            if (word && !prefix)
+                || matches!(prev, "]" | ")")
+                || prev.starts_with(['\'', '"'])
+                || prev.bytes().next().is_some_and(|b| b.is_ascii_digit())
+            {
+                continue;
+            }
+        }
+        for i in open + 1..close {
+            if t[i]
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'$')
+            {
+                result.insert(i);
+            }
+        }
+    }
+    result
+}
+
+/// Decimal integer tokens only; legacy JS leading-zero syntax is ambiguous.
+pub(super) fn decimal_integer(s: &str) -> Option<i64> {
+    if s.len() > 1 && s.starts_with('0') {
+        return None;
+    }
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
 }

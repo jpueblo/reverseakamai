@@ -1,56 +1,81 @@
 //! Static support for the numeric delta-string layout in recovered bmak builds.
 //! This is a constrained recognizer, not a JavaScript interpreter. It reads only
 //! integer expressions, unary-minus helpers, tables, and numeric stack seeds.
+use super::ast_scope::{Analysis, Numbers};
 use super::literal_arrays::tokens;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
+const DELTA_CANDIDATE_WORK_BUDGET: usize = 2_000_000;
 
 #[derive(Clone)]
 enum Expr {
     Num(i64),
     Array,
     Object,
-    Ref(String),
+    Ref(String, usize),
     Unary(String, Box<Expr>),
     Binary(String, Box<Expr>, Box<Expr>),
 }
 #[derive(Clone, Copy)]
 enum Value {
     Num(i64),
+    Bool(bool),
     Array,
     Object,
 }
 impl Value {
-    fn number(self) -> i64 {
+    fn number(self) -> Option<i64> {
         match self {
-            Self::Num(n) => n,
-            Self::Array | Self::Object => 0,
+            Self::Num(n) => Some(n),
+            Self::Bool(b) => Some(i64::from(b)),
+            Self::Array => Some(0),
+            Self::Object => None,
         }
     }
     fn truth(self) -> bool {
         match self {
             Self::Num(n) => n != 0,
+            Self::Bool(b) => b,
             Self::Array | Self::Object => true,
         }
     }
 }
+trait NumberLookup {
+    fn lookup(&self, name: &str, address: usize) -> Option<i64>;
+}
+impl NumberLookup for BTreeMap<String, i64> {
+    fn lookup(&self, name: &str, _: usize) -> Option<i64> {
+        self.get(name).copied()
+    }
+}
+impl NumberLookup for Numbers {
+    fn lookup(&self, name: &str, address: usize) -> Option<i64> {
+        self.get_ref(name, address).copied()
+    }
+}
+impl<T: NumberLookup + ?Sized> NumberLookup for &T {
+    fn lookup(&self, name: &str, address: usize) -> Option<i64> {
+        (**self).lookup(name, address)
+    }
+}
 impl Expr {
-    fn value(&self, k: &BTreeMap<String, i64>) -> Option<Value> {
+    fn value(&self, k: &impl NumberLookup) -> Option<Value> {
         Some(match self {
             Self::Num(n) => Value::Num(*n),
             Self::Array => Value::Array,
             Self::Object => Value::Object,
-            Self::Ref(n) => Value::Num(*k.get(n)?),
+            Self::Ref(n, at) => Value::Num(k.lookup(n, *at)?),
             Self::Unary(op, a) => {
                 let a = a.value(k)?;
                 if matches!(a, Value::Object) && op != "!" {
                     return None;
                 }
-                Value::Num(match op.as_str() {
-                    "+" => a.number(),
-                    "-" => a.number().checked_neg()?,
-                    "!" => i64::from(!a.truth()),
+                match op.as_str() {
+                    "+" => Value::Num(a.number()?),
+                    "-" => Value::Num(a.number()?.checked_neg()?),
+                    "!" => Value::Bool(!a.truth()),
                     _ => return None,
-                })
+                }
             }
             Self::Binary(op, a, b) => {
                 let av = a.value(k)?;
@@ -61,8 +86,8 @@ impl Expr {
                 if op == "+" && (matches!(av, Value::Array) || matches!(bv, Value::Array)) {
                     return None;
                 }
-                let a = av.number();
-                let b = bv.number();
+                let a = av.number()?;
+                let b = bv.number()?;
                 Value::Num(match op.as_str() {
                     "+" => a.checked_add(b)?,
                     "-" => a.checked_sub(b)?,
@@ -127,8 +152,8 @@ impl Parser<'_, '_> {
                     Box::new(e),
                 )
             }
-            s if ident(s) => Expr::Ref(s.into()),
-            s => Expr::Num(s.parse().ok()?),
+            s if ident(s) => Expr::Ref(s.into(), s.as_ptr() as usize),
+            s => Expr::Num(super::literal_arrays::decimal_integer(s)?),
         };
         loop {
             let Some(&op) = self.t.get(self.i) else { break };
@@ -160,8 +185,9 @@ fn expression(t: &[&str], i: usize, minus: &BTreeSet<String>) -> Option<(Expr, u
     let e = p.expr(0, 0)?;
     Some((e, p.i))
 }
-fn constants(t: &[&str], minus: &BTreeSet<String>) -> BTreeMap<String, i64> {
+fn legacy_constants(t: &[&str], minus: &BTreeSet<String>) -> BTreeMap<String, i64> {
     let mut assignments: BTreeMap<String, Vec<Expr>> = BTreeMap::new();
+    let mutations = super::literal_arrays::legacy_mutation_indices(t);
     let mut blocked = BTreeSet::new();
     // The supported layout initializes numbers in the outer script or its
     // direct dispatchers. Embedded programs have independent, reused names.
@@ -200,7 +226,7 @@ fn constants(t: &[&str], minus: &BTreeSet<String>) -> BTreeMap<String, i64> {
         if depth > 2 || !ident(t[i]) || (i > 0 && t[i - 1] == ".") {
             continue;
         }
-        if matches!(t[i + 1], "+=" | "-=" | "++" | "--" | "*=" | "/=") {
+        if mutations.contains(&i) {
             blocked.insert(t[i].to_owned());
             continue;
         }
@@ -226,7 +252,7 @@ fn constants(t: &[&str], minus: &BTreeSet<String>) -> BTreeMap<String, i64> {
                 .iter()
                 .map(|e| match e.value(&known)? {
                     Value::Num(n) => Some(n),
-                    Value::Array | Value::Object => None,
+                    Value::Bool(_) | Value::Array | Value::Object => None,
                 })
                 .collect();
             if let Some(values) = values {
@@ -247,11 +273,30 @@ fn constants(t: &[&str], minus: &BTreeSet<String>) -> BTreeMap<String, i64> {
 fn array(
     t: &[&str],
     start: usize,
-    k: &BTreeMap<String, i64>,
+    k: &Numbers,
     minus: &BTreeSet<String>,
     depth: usize,
 ) -> Option<(Vec<Option<i64>>, usize)> {
     if depth > 32 || t.get(start) != Some(&"[") {
+        return None;
+    }
+    if !k.is_legacy() {
+        let values = k.array(t[start])?;
+        let mut level = 1usize;
+        let mut end = start + 1;
+        while end < t.len() {
+            match t[end] {
+                "[" => level += 1,
+                "]" => {
+                    level -= 1;
+                    if level == 0 {
+                        return Some((values.clone(), end + 1));
+                    }
+                }
+                _ => {}
+            }
+            end += 1;
+        }
         return None;
     }
     let mut a = Vec::new();
@@ -266,7 +311,10 @@ fn array(
             a.push(None)
         } else {
             let (e, end) = expression(t, i, minus)?;
-            a.push(Some(e.value(k)?.number()));
+            a.push(match e.value(k)? {
+                Value::Num(n) => Some(n),
+                _ => None,
+            });
             i = end
         }
         if t.get(i) == Some(&",") {
@@ -304,163 +352,286 @@ fn decode(table: &[Option<i64>], start: i64, seed: i64) -> Option<String> {
     };
     (sextet % 4 == 0).then_some(out)
 }
-/// Pure arithmetic constants from supported outer/direct dispatcher scopes.
-pub(super) fn integer_constants(t: &[&str]) -> BTreeMap<String, i64> {
-    let mut minus = BTreeSet::new();
-    for w in t.windows(12) {
-        if ident(w[0])
-            && w[1..4] == ["=", "function", "("]
-            && ident(w[4])
-            && w[5..9] == [")", "{", "return", "-"]
-            && w[9] == w[4]
-            && w[10..12] == [";", "}"]
-        {
-            minus.insert(w[0].into());
-        }
-    }
-    constants(t, &minus)
-}
-
 struct DecoderFunction<'a> {
     name: &'a str,
     params: Vec<&'a str>,
     begin: usize,
     end: usize,
 }
-fn decoder_functions<'a>(t: &[&'a str]) -> Vec<DecoderFunction<'a>> {
-    let mut functions = Vec::new();
-    for i in 0..t.len() {
-        if t[i] != "function" {
-            continue;
-        }
-        let assigned = if i >= 2 && t[i - 1] == "=" && ident(t[i - 2]) {
-            Some(t[i - 2])
-        } else {
-            None
-        };
-        let (name, open) = if t.get(i + 1) == Some(&"(") {
-            let Some(name) = assigned else { continue };
-            (name, i + 1)
-        } else if t.get(i + 2) == Some(&"(") && t.get(i + 1).is_some_and(|v| ident(v)) {
-            (assigned.unwrap_or(t[i + 1]), i + 2)
-        } else {
-            continue;
-        };
-        let Some(close) = (open + 1..t.len()).find(|&j| t[j] == ")") else {
-            continue;
-        };
-        let parts = &t[open + 1..close];
-        if parts.is_empty()
-            || !parts
+fn decoder_functions<'a>(t: &[&'a str], ast: &Analysis, source: &str) -> Vec<DecoderFunction<'a>> {
+    let at = |offset: u32| {
+        t.partition_point(|token| {
+            (token.as_ptr() as usize - source.as_ptr() as usize) < offset as usize
+        })
+    };
+    ast.functions
+        .iter()
+        .filter_map(|f| {
+            let name = *t.get(at(f.name))?;
+            let params = f
+                .params
                 .iter()
-                .enumerate()
-                .all(|(j, v)| if j % 2 == 0 { ident(v) } else { *v == "," })
+                .map(|p| t.get(at(*p)).copied())
+                .collect::<Option<Vec<_>>>()?;
+            Some(DecoderFunction {
+                name,
+                params,
+                begin: at(f.begin),
+                end: at(f.end),
+            })
+        })
+        .collect()
+}
+
+fn supported_decoder_body(
+    body: &[&str],
+    owner: &str,
+    data: &str,
+    seed: &[&str],
+    step: &[&str],
+    length: &str,
+) -> bool {
+    for out in body
+        .windows(5)
+        .filter(|w| w[0] == "var" && w[2] == "=" && matches!(w[3], "''" | "\"\"") && w[4] == ";")
+    {
+        let output = out[1];
+        let acc = seed[0];
+        let sub = seed[2];
+        let initial = seed[4];
+        let stack = seed[6];
+        let one = seed[14];
+        let index = step[4];
+        let roles = [output, acc, data, index, length, initial, stack];
+        if roles.iter().any(|n| !ident(n))
+            || roles.iter().copied().collect::<BTreeSet<_>>().len() != roles.len()
         {
             continue;
         }
-        if t.get(close + 1) != Some(&"{") {
-            continue;
+        let expected = format!(
+            "if(typeof {data}==='number'){{{data}={owner};}}var {acc}={sub}({initial},{stack}[{sub}({stack}.length,{one})]);var {output}='';while({length}-->0){{{output}+=String.fromCharCode({acc});{acc}+={data}[{index}];{index}++;}}return {output};"
+        );
+        let expected = tokens(&expected);
+        if expected.len() == body.len()
+            && expected.iter().zip(body).all(|(a, b)| {
+                a == b || matches!((*a, *b), ("''", "\"\"") | ("'number'", "\"number\""))
+            })
+        {
+            return true;
         }
-        let mut level = 1i32;
-        let mut end = close + 2;
-        while end < t.len() {
-            match t[end] {
-                "{" => level += 1,
-                "}" => level -= 1,
-                _ => {}
-            }
-            if level == 0 {
-                break;
-            }
-            end += 1;
-        }
-        if end == t.len() {
-            continue;
-        }
-        functions.push(DecoderFunction {
-            name,
-            params: parts.iter().step_by(2).copied().collect(),
-            begin: close + 2,
-            end,
-        });
     }
-    functions
+    false
+}
+
+fn direct_return_dispatcher(
+    t: &[&str],
+    f: &DecoderFunction<'_>,
+    array_start: usize,
+    array_end: usize,
+    label: &str,
+) -> bool {
+    if f.params.len() != 2 || f.params[0] == f.params[1] {
+        return false;
+    }
+    for braced in [true, false] {
+        let prefix = format!(
+            "switch({}){{case {label}:{}return",
+            f.params[0],
+            if braced { "{" } else { "" }
+        );
+        let mut expected = tokens(&prefix);
+        expected.extend_from_slice(&t[array_start..array_end]);
+        let suffix = if braced { ";}}" } else { ";}" };
+        let end = tokens(suffix);
+        expected.extend_from_slice(&end);
+        if expected == t[f.begin..f.end] {
+            return true;
+        }
+    }
+    false
 }
 
 pub(super) fn extract(source: &str) -> Option<String> {
+    let ast = if super::verified_legacy_layout(source) {
+        Analysis::default()
+    } else {
+        Analysis::parse(source)?
+    };
+    extract_with_analysis(source, &ast)
+}
+pub(super) fn extract_with_analysis(source: &str, ast: &Analysis) -> Option<String> {
+    extract_with_budget(source, ast, DELTA_CANDIDATE_WORK_BUDGET)
+}
+fn extract_with_budget(source: &str, ast: &Analysis, mut candidate_work: usize) -> Option<String> {
+    let allow_legacy = super::verified_legacy_layout(source);
+    if ast.dynamic || (!allow_legacy && !ast.builtin_methods_intact()) {
+        return None;
+    }
     let t = tokens(source);
-    let functions = decoder_functions(&t);
+    let functions = decoder_functions(&t, &ast, source);
     let mut minus = BTreeSet::new();
     let mut subtract = BTreeSet::new();
-    for w in t.windows(12) {
-        if ident(w[0])
-            && w[1..4] == ["=", "function", "("]
-            && ident(w[4])
-            && w[5..9] == [")", "{", "return", "-"]
-            && w[9] == w[4]
-            && w[10..12] == [";", "}"]
-        {
-            minus.insert(w[0].into());
+    if allow_legacy {
+        for w in t.windows(12) {
+            if ident(w[0])
+                && w[1..4] == ["=", "function", "("]
+                && ident(w[4])
+                && w[5..9] == [")", "{", "return", "-"]
+                && w[9] == w[4]
+                && w[10..12] == [";", "}"]
+            {
+                minus.insert(w[0].into());
+            }
+        }
+        for w in t.windows(15) {
+            if ident(w[0])
+                && w[1..4] == ["=", "function", "("]
+                && w[5] == ","
+                && w[7..10] == [")", "{", "return"]
+                && w[10] == w[4]
+                && w[11] == "-"
+                && w[12] == w[6]
+                && w[13..15] == [";", "}"]
+            {
+                subtract.insert(w[0]);
+            }
+        }
+        for w in t.windows(12) {
+            if ident(w[0])
+                && w[1..4] == ["=", "function", "("]
+                && ident(w[4])
+                && w[5..9] == [")", "{", "return", "!"]
+                && w[9] == w[4]
+                && w[10..12] == [";", "}"]
+            {
+                minus.insert(format!("!{}", w[0]));
+            }
         }
     }
-    for w in t.windows(15) {
-        if ident(w[0])
-            && w[1..4] == ["=", "function", "("]
-            && w[5] == ","
-            && w[7..10] == [")", "{", "return"]
-            && w[10] == w[4]
-            && w[11] == "-"
-            && w[12] == w[6]
-            && w[13..15] == [";", "}"]
-        {
-            subtract.insert(w[0]);
+    let legacy_numbers = if allow_legacy {
+        Numbers::legacy(legacy_constants(&t, &minus))
+    } else {
+        Numbers::default()
+    };
+    let known = if allow_legacy {
+        &legacy_numbers
+    } else {
+        &ast.numbers
+    };
+    // Stream properly nested function spans instead of rescanning all functions
+    // for every returned array. Index potential factory calls by semantic ID.
+    let mut function_order: Vec<_> = (0..functions.len()).collect();
+    function_order.sort_by_key(|index| {
+        (
+            functions[*index].begin,
+            std::cmp::Reverse(functions[*index].end),
+        )
+    });
+    let mut next_function = 0;
+    let mut active_functions: Vec<usize> = Vec::new();
+    let mut factory_calls: BTreeMap<_, Vec<(usize, &[&str])>> = BTreeMap::new();
+    for (call, w) in t.windows(9).enumerate() {
+        if ident(w[0]) && w[1] == "=" && ident(w[2]) && w[3] == "(" {
+            if let Some(id) = ast.symbol(w[2]) {
+                factory_calls.entry(id).or_default().push((call, w));
+            }
         }
     }
-    for w in t.windows(12) {
-        if ident(w[0])
-            && w[1..4] == ["=", "function", "("]
-            && ident(w[4])
-            && w[5..9] == [")", "{", "return", "!"]
-            && w[9] == w[4]
-            && w[10..12] == [";", "}"]
-        {
-            minus.insert(format!("!{}", w[0]));
-        }
-    }
-    let known = constants(&t, &minus);
-    let mut tables = Vec::new();
-    let allow_legacy = super::verified_legacy_layout(source);
+    let mut tables: BTreeMap<_, Vec<_>> = BTreeMap::new();
     let mut bound_tables = Vec::new();
     for i in 0..t.len().saturating_sub(2) {
+        while active_functions
+            .last()
+            .is_some_and(|index| functions[*index].end <= i)
+        {
+            active_functions.pop();
+        }
+        while next_function < function_order.len()
+            && functions[function_order[next_function]].begin <= i
+        {
+            let index = function_order[next_function];
+            next_function += 1;
+            while active_functions
+                .last()
+                .is_some_and(|outer| functions[*outer].end <= functions[index].begin)
+            {
+                active_functions.pop();
+            }
+            if functions[index].end > i {
+                active_functions.push(index);
+            }
+        }
+
         let (array_start, owners) = if ident(t[i]) && t[i + 1] == "=" && t[i + 2] == "[" {
             (i + 2, vec![t[i]])
         } else if t[i] == "return" && t[i + 1] == "[" {
-            let label = t[..i]
-                .windows(3)
-                .rev()
-                .find(|w| w[0] == "case" && w[2] == ":")
-                .map(|w| w[1]);
-            let Some(label) = label else { continue };
-            let owners = t
-                .windows(9)
-                .filter(|w| {
-                    ident(w[0])
-                        && w[1] == "="
-                        && w[3] == "("
-                        && w[4] == label
-                        && w[5..9] == [",", "[", "]", ")"]
+            let Some(dispatcher) = active_functions.last().map(|index| &functions[*index]) else {
+                continue;
+            };
+            // A supported dispatcher has its one return immediately after
+            // switch(param){case label:[{]. No growing prefix scan is needed.
+            if dispatcher.params.len() != 2
+                || !matches!(i.checked_sub(dispatcher.begin), Some(8 | 9))
+                || t.get(dispatcher.begin..dispatcher.begin + 6)
+                    != Some(&["switch", "(", dispatcher.params[0], ")", "{", "case"])
+                || t.get(dispatcher.begin + 7) != Some(&":")
+            {
+                continue;
+            }
+            let Some(label) = t.get(dispatcher.begin + 6).copied() else {
+                continue;
+            };
+            let Some((_, literal_end)) = array(&t, i + 1, &known, &minus, 0) else {
+                continue;
+            };
+            if !direct_return_dispatcher(&t, dispatcher, i + 1, literal_end, label)
+                || !ast.stable(dispatcher.name)
+            {
+                continue;
+            }
+            let owners = ast
+                .symbol(dispatcher.name)
+                .and_then(|id| factory_calls.get(&id))
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|(call, w)| {
+                    if *call <= dispatcher.end
+                        || !ident(w[0])
+                        || w[1] != "="
+                        || !ast.same(w[2], dispatcher.name)
+                        || w[3] != "("
+                        || (!ident(w[4]) && w[4].parse::<i64>().is_err())
+                        || (ident(w[4]) && !known.get(w[4]).is_some())
+                        || (label != dispatcher.params[0]
+                            && w[4] != label
+                            && (known.get(label).is_none() || known.get(w[4]) != known.get(label)))
+                        || w[5..9] != [",", "[", "]", ")"]
+                        || !matches!(t.get(call + 9), Some(&";" | &","))
+                    {
+                        return false;
+                    }
+                    true
                 })
-                .map(|w| w[0])
+                .map(|(_, w)| w[0])
                 .collect();
             (i + 1, owners)
         } else {
             continue;
         };
-        let Some((a, _)) = array(&t, array_start, &known, &minus, 0) else {
+        let Some((a, array_end)) = array(&t, array_start, &known, &minus, 0) else {
             continue;
         };
-        if a.len() >= 44 {
+        if !matches!(t.get(array_end), Some(&";" | &"," | &"}")) {
+            continue;
+        }
+        if a.len() >= 44 && (allow_legacy || a.windows(44).any(|w| w.iter().all(Option::is_some))) {
+            // Many owner bindings may refer to one literal table. Share data.
+            let a = Rc::new(a);
             for owner in owners {
+                if !allow_legacy && !ast.stable(owner) {
+                    continue;
+                }
                 bound_tables.push((owner, a.clone()));
             }
         }
@@ -499,17 +670,25 @@ pub(super) fn extract(source: &str) -> Option<String> {
             }
         }
     }
+    let decoder_body_len=tokens("if(typeof d==='number'){d=t;}var c=s(i,k[s(k.length,o)]);var r='';while(l-->0){r+=String.fromCharCode(c);c+=d[x];x++;}return r;").len();
+    let candidate_functions: Vec<_> = functions
+        .iter()
+        .filter(|function| {
+            function.end - function.begin == decoder_body_len && ast.stable(function.name)
+        })
+        .collect();
     for (owner, a) in bound_tables {
+        if allow_legacy {
+            break;
+        } // Exact-build compatibility uses only the verified legacy path.
         // Bind each table to its delta accumulator and seed stack. Arbitrary
         // arrays and unrelated push() calls cannot serve as decoders.
-        for function in &functions {
-            if functions.iter().filter(|f| f.name == function.name).count() != 1 {
-                continue;
-            }
+        for function in &candidate_functions {
+            candidate_work = candidate_work.checked_sub(decoder_body_len)?;
             let body = &t[function.begin..function.end];
             for fallback in body
                 .windows(4)
-                .filter(|w| w[1] == "=" && w[2] == owner && w[3] == ";")
+                .filter(|w| w[1] == "=" && ast.same(w[2], owner) && w[3] == ";")
             {
                 for step in body.windows(7).filter(|w| {
                     w[1] == "+=" && w[2] == fallback[0] && w[3] == "[" && w[5..7] == ["]", ";"]
@@ -517,7 +696,7 @@ pub(super) fn extract(source: &str) -> Option<String> {
                     for seed in body.windows(19) {
                         if seed[0] != step[0]
                             || seed[1] != "="
-                            || !subtract.contains(seed[2])
+                            || !ast.subtract(seed[2])
                             || seed[3] != "("
                             || seed[5] != ","
                             || seed[7] != "["
@@ -547,15 +726,48 @@ pub(super) fn extract(source: &str) -> Option<String> {
                             else {
                                 continue;
                             };
-                            tables.push((
+                            let begin = ast.offset(t[function.begin])?;
+                            let end = ast.offset(t[function.end])?;
+                            if !ast.dependency(owner, begin, end, false)
+                                || !ast.dependency(seed[6], begin, end, true)
+                            {
+                                continue;
+                            }
+                            if !body.windows(4).any(|w| {
+                                w[1..] == [".", "fromCharCode", "("] && ast.builtin(w[0], "String")
+                            }) {
+                                continue;
+                            }
+                            if !supported_decoder_body(
+                                body,
+                                owner,
+                                fallback[0],
+                                seed,
+                                step,
+                                length[2],
+                            ) {
+                                continue;
+                            }
+                            let data_arg = function.params.iter().position(|p| *p == fallback[0]);
+                            if data_arg.is_none() && !ast.numeric_data(fallback[0], begin, end) {
+                                continue;
+                            }
+                            if function.params.iter().collect::<BTreeSet<_>>().len()
+                                != function.params.len()
+                            {
+                                continue;
+                            }
+                            tables.entry(ast.symbol(function.name)?).or_default().push((
                                 a.clone(),
                                 seed[6],
                                 function.name,
+                                owner,
                                 function.end,
                                 initial_arg,
                                 index_arg,
                                 length_arg,
                                 function.params.len(),
+                                data_arg,
                             ));
                         }
                     }
@@ -566,24 +778,30 @@ pub(super) fn extract(source: &str) -> Option<String> {
     let mut scope: Vec<Option<(&str, Option<i64>)>> = vec![None];
     let mut candidates = BTreeSet::new();
     for i in 0..t.len() {
-        match t[i] {
-            "{" => scope.push(None),
-            "}" => {
-                scope.pop();
-                if scope.is_empty() {
-                    scope.push(None)
+        if allow_legacy {
+            match t[i] {
+                "{" => scope.push(None),
+                "}" => {
+                    scope.pop();
+                    if scope.is_empty() {
+                        scope.push(None)
+                    }
                 }
+                _ => {}
             }
-            _ => {}
-        }
-        if i > 0 && t.get(i..i + 4) == Some(&[".", "pop", "(", ")"]) {
-            *scope.last_mut()? = Some((t[i - 1], None));
-        }
-        if i > 0 && t.get(i..i + 3) == Some(&[".", "push", "("]) {
-            *scope.last_mut()? = Some((t[i - 1], None));
-            if let Some((e, end)) = expression(&t, i + 3, &minus) {
-                if t.get(end) == Some(&")") {
-                    *scope.last_mut()? = Some((t[i - 1], e.value(&known).map(Value::number)));
+            if i > 0 && t.get(i..i + 4) == Some(&[".", "pop", "(", ")"]) {
+                *scope.last_mut()? = Some((t[i - 1], None));
+            }
+            if i > 0 && t.get(i..i + 3) == Some(&[".", "push", "("]) {
+                *scope.last_mut()? = Some((t[i - 1], None));
+                if let Some((e, end)) = expression(&t, i + 3, &minus) {
+                    if t.get(end) == Some(&")") {
+                        *scope.last_mut()? = Some((
+                            t[i - 1],
+                            e.value(&known)
+                                .and_then(|v| if let Value::Num(n) = v { Some(n) } else { None }),
+                        ));
+                    }
                 }
             }
         }
@@ -596,10 +814,10 @@ pub(super) fn extract(source: &str) -> Option<String> {
         if t.get(end) != Some(&")") {
             continue;
         }
-        let Some((stack, Some(seed))) = scope.iter().rev().find_map(|n| *n) else {
-            continue;
-        };
         if allow_legacy {
+            let Some((stack, Some(seed))) = scope.iter().rev().find_map(|n| *n) else {
+                continue;
+            };
             if let [Some(44), Some(initial), Some(index), _] = args.as_slice() {
                 if let Some(initial) = initial.checked_sub(seed) {
                     for (table, decoder_stack) in &legacy_tables {
@@ -611,32 +829,43 @@ pub(super) fn extract(source: &str) -> Option<String> {
                     }
                 }
             }
+            continue;
         }
+        let Some(matches) = i
+            .checked_sub(1)
+            .and_then(|index| ast.symbol(t[index]))
+            .and_then(|id| tables.get(&id))
+        else {
+            continue;
+        };
         for (
             table,
             decoder_stack,
             callee,
+            owner,
             definition_end,
             initial_arg,
             index_arg,
             length_arg,
             arity,
-        ) in &tables
+            data_arg,
+        ) in matches
         {
             if i == 0
-                || t[i - 1] != *callee
+                || !ast.same(t[i - 1], callee)
                 || (i >= 2 && t[i - 2] == ".")
                 || i <= *definition_end
-                || *decoder_stack != stack
                 || args.len() != *arity
             {
                 continue;
             }
-            // Reassignment would invalidate the retained function identity.
-            if t[*definition_end..i]
-                .windows(2)
-                .any(|w| w[0] == *callee && w[1] == "=")
-            {
+            if !ast.available_before(owner, t[i - 1]) {
+                continue;
+            }
+            let Some(seed) = ast.push_seed(decoder_stack, t[i - 1]) else {
+                continue;
+            };
+            if data_arg.is_some_and(|p| args[p].is_none()) {
                 continue;
             }
             if args[*length_arg] != Some(44) {
@@ -764,6 +993,47 @@ mod tests {
         assert_eq!(extract(&renamed), extract(FIXTURE));
     }
     #[test]
+    fn rejects_prefix_mutated_delta_constants() {
+        for mutation in [
+            "++seed;",
+            "--seed;",
+            "seed++;",
+            "seed--;",
+            "++initial;",
+            "initial%=7;",
+        ] {
+            assert_eq!(
+                extract(
+                    &FIXTURE.replace("stack.push(seed);", &format!("{mutation}stack.push(seed);"))
+                ),
+                None,
+                "{mutation}"
+            );
+        }
+    }
+    #[test]
+    fn returned_table_requires_its_own_dispatcher() {
+        let source = include_str!("fixtures/homedepot_fresh_return_delta.js");
+        let unrelated = source.replace("table=factory(state,[])", "table=unrelated(state,[])")
+            + "function unrelated(){return [];}";
+        assert_eq!(extract(&unrelated), None);
+        let renamed = source.replace("factory", "renamed_factory");
+        assert_eq!(extract(&renamed), extract(source));
+    }
+    #[test]
+    fn delta_decoder_requires_supported_output_and_progression() {
+        for (from, to) in [
+            ("return out;", "return 'not a version';"),
+            ("fromCharCode(code)", "fromCharCode(code+1)"),
+            ("index++;", "index--;"),
+            ("code+=data[index]", "code+=data[index+1]"),
+            ("out='';", "out='prefix';"),
+            ("return out;", "out='different';return out;"),
+        ] {
+            assert_eq!(extract(&FIXTURE.replace(from, to)), None, "{to}");
+        }
+    }
+    #[test]
     fn rejects_invalid_four_argument_layout_or_seed() {
         let source = include_str!("fixtures/homedepot_217bb3_four_args.js");
         for broken in [
@@ -778,5 +1048,497 @@ mod tests {
         ] {
             assert_eq!(extract(&broken), None);
         }
+    }
+
+    #[test]
+    fn unsupported_mutations_invalidate_constants_at_any_depth() {
+        for mutation in [
+            "start||=1;",
+            "seed&&=867;",
+            "seed**=2;",
+            "seed>>>=1;",
+            "[seed]=[867];",
+            "({seed}={seed:867});",
+            "for(seed of [867]){}",
+            "for(seed in {}){}",
+            "function a(){function b(){function c(){seed++;}}}",
+        ] {
+            assert_eq!(
+                extract(
+                    &FIXTURE.replace("stack.push(seed);", &format!("{mutation}stack.push(seed);"))
+                ),
+                None,
+                "{mutation}"
+            );
+        }
+    }
+    #[test]
+    fn runtime_numbers_are_required_for_decoder_roles() {
+        for args in [
+            "[size,!1,0,initial,0,start]",
+            "[size,0,0,initial,0,{}]",
+            "[size,0,0,initial,0,!1]",
+            "[size,[],0,initial,0,start]",
+        ] {
+            assert_eq!(
+                extract(&FIXTURE.replace("[size,0,0,initial,0,start]", args)),
+                None,
+                "{args}"
+            );
+        }
+        let fresh = include_str!("fixtures/homedepot_fresh_return_delta.js");
+        for changed in [
+            fresh.replace("var data=0;", "var data=!0;"),
+            fresh.replace("7,0,38", "7,{},38"),
+        ] {
+            assert_eq!(extract(&changed), None);
+        }
+        assert_eq!(
+            extract(&FIXTURE.replace("[size,0,0,initial,0,start]", "[size,+!1,0,initial,0,start]"))
+                .as_deref(),
+            Some(TOKEN)
+        );
+    }
+    #[test]
+    fn global_data_source_must_be_stable_and_unshadowed() {
+        let fresh = include_str!("fixtures/homedepot_fresh_return_delta.js");
+        for mutation in ["data||=[];", "[data]=[[]];", "data&&=[];"] {
+            assert_eq!(
+                extract(&fresh.replace("var data=0;", &format!("var data=0;{mutation}"))),
+                None,
+                "{mutation}"
+            );
+        }
+        let wrapped = fresh.replace(
+            "function decoder(",
+            "function outer(data){function decoder(",
+        ) + "}outer([]);";
+        assert_eq!(extract(&wrapped), None);
+    }
+    #[test]
+    fn decoder_dependencies_cannot_be_replaced_or_transformed() {
+        for mutation in [
+            "decoder=unrelated;",
+            "sub=function(a,b){return b-a;};",
+            "negative=function(n){return n;};",
+            "table=[];",
+            "table.reverse();",
+            "stack=[];",
+            "function alter(){stack.pop();}alter();",
+            "String.fromCharCode=function(){return 65;};",
+            "function String(){}",
+            "decoder.apply=function(){return 'x';};",
+            "Function.prototype.apply=function(){return 'x';};",
+        ] {
+            let source =
+                FIXTURE.replace("stack.push(seed);", &format!("stack.push(seed);{mutation}"));
+            assert_eq!(extract(&source), None, "{mutation}");
+        }
+        assert_eq!(extract(&format!("decoder=unrelated;{FIXTURE}")), None);
+        assert_eq!(
+            extract(&FIXTURE.replace("negative(65)];", "negative(65)].reverse();")),
+            None
+        );
+        let wrapped = FIXTURE.replace(
+            "stack.push(seed);",
+            "function run(decoder){stack.push(seed);",
+        ) + "}run(unrelated);";
+        assert_eq!(extract(&wrapped), None);
+    }
+    #[test]
+    fn dispatcher_must_directly_return_matching_case() {
+        let fresh = include_str!("fixtures/homedepot_fresh_return_delta.js");
+        for source in [
+            fresh.replace("factory(state,args)", "factory(args,state)"),
+            fresh.replace("case state:{return", "case state:break;default:{return"),
+            fresh
+                .replace("case state:{return", "case state:{var f=function(){return")
+                .replace(";}}}", ";};}}}"),
+            fresh.replace(";}}}", ".slice(1);}}}"),
+            fresh.replace("factory(state,[]);", "factory(state,[]).reverse();"),
+            format!("factory=unrelated;{fresh}"),
+        ] {
+            assert_eq!(extract(&source), None);
+        }
+    }
+
+    #[test]
+    fn block_stack_writes_and_deep_plain_writes_fail_closed() {
+        for mutation in [
+            "if(1){stack.pop();}",
+            "if(1){stack.push(1);}",
+            "function a(){function b(){function c(){seed=867;}c();}b();}a();",
+        ] {
+            assert_eq!(
+                extract(
+                    &FIXTURE.replace("stack.push(seed);", &format!("stack.push(seed);{mutation}"))
+                ),
+                None,
+                "{mutation}"
+            );
+        }
+    }
+    #[test]
+    fn unknown_binding_scopes_and_table_helper_shadows_fail_closed() {
+        for (begin, end) in [
+            ("((decoder)=>{", "})(function(){return 'x';});"),
+            (
+                "function run({decoder}){",
+                "}run({decoder:function(){return 'x';}});",
+            ),
+            ("function run(...decoder){", "}run([]);"),
+            ("try{throw 0}catch(decoder){", "}"),
+        ] {
+            let changed =
+                FIXTURE.replace("stack.push(seed);", &format!("{begin}stack.push(seed);")) + end;
+            assert_eq!(extract(&changed), None, "{begin}");
+        }
+        assert_eq!(
+            extract(&FIXTURE.replace(
+                "stack.push(seed);",
+                "stack.push(seed);var f=()=>{stack.pop();};f();"
+            )),
+            None
+        );
+        let changed = FIXTURE
+            .replace("var table=[", "function init(negative){table=[")
+            .replace(
+                "negative(65)];",
+                "negative(65)];}init(function(n){return n;});",
+            );
+        assert_eq!(extract(&changed), None);
+    }
+    #[test]
+    fn visible_bracket_apply_and_prototype_overrides_fail_closed() {
+        for mutation in [
+            "decoder['apply']=function(){return 'x';};",
+            "Function.prototype['apply']=function(){return 'x';};",
+            "Object.defineProperty(Function.prototype,'apply',{});",
+            "Array.prototype.push=function(){};",
+            "Array['prototype'].push=function(){};",
+        ] {
+            assert_eq!(
+                extract(
+                    &FIXTURE.replace("stack.push(seed);", &format!("{mutation}stack.push(seed);"))
+                ),
+                None,
+                "{mutation}"
+            );
+        }
+    }
+    #[test]
+    fn octal_and_late_global_data_are_unsupported() {
+        assert_eq!(extract(&FIXTURE.replace("size=one*44", "size=044")), None);
+        let fresh = include_str!("fixtures/homedepot_fresh_return_delta.js");
+        assert_eq!(
+            extract(&(fresh.replace("var data=0;", "") + "var data=0;")),
+            None
+        );
+    }
+
+    #[test]
+    fn method_and_class_scopes_are_unsupported() {
+        for (begin, end) in [
+            ("({run(decoder){", "}}).run(function(){return 'x';});"),
+            (
+                "class C{static run(decoder){",
+                "}}C.run(function(){return 'x';});",
+            ),
+            ("({set v(decoder){", "}}).v=function(){return 'x';};"),
+        ] {
+            assert_eq!(
+                extract(
+                    &(FIXTURE.replace("stack.push(seed);", &format!("{begin}stack.push(seed);"))
+                        + end)
+                ),
+                None,
+                "{begin}"
+            );
+        }
+    }
+    #[test]
+    fn bare_declarations_cannot_shadow_decoder_constants_or_roles() {
+        for name in [
+            "size", "seed", "start", "initial", "table", "stack", "sub", "decoder",
+        ] {
+            assert_eq!(
+                extract(
+                    &(FIXTURE.replace(
+                        "stack.push(seed);",
+                        &format!("{{let {name};stack.push(seed);")
+                    ) + "}")
+                ),
+                None,
+                "{name}"
+            );
+        }
+        let wrapped = FIXTURE.replace(
+            "function decoder(",
+            "function outer(){var one;function decoder(",
+        ) + "}outer();";
+        assert_eq!(extract(&wrapped), None);
+        assert_eq!(
+            extract(
+                &(FIXTURE.replace(
+                    "stack.push(seed);",
+                    "function run(){function initial(){}stack.push(seed);"
+                ) + "}run();")
+            ),
+            None
+        );
+    }
+    #[test]
+    fn visible_indirect_prototype_writes_are_unsupported() {
+        for mutation in [
+            "decoder.__proto__.apply=function(){return 'x';};",
+            "[].__proto__.push=function(){};",
+            "Object.setPrototypeOf(decoder,{});",
+        ] {
+            assert_eq!(
+                extract(
+                    &FIXTURE.replace("stack.push(seed);", &format!("{mutation}stack.push(seed);"))
+                ),
+                None,
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn chained_and_conditional_destructuring_updates_are_not_constants() {
+        for mutation in [
+            "x=[seed]=[867];",
+            "0?0:[seed]=[867];",
+            "x={seed}={seed:867};",
+        ] {
+            assert_eq!(
+                extract(
+                    &FIXTURE.replace("stack.push(seed);", &format!("{mutation}stack.push(seed);"))
+                ),
+                None,
+                "{mutation}"
+            );
+        }
+    }
+    #[test]
+    fn reserved_word_method_names_are_not_control_statements() {
+        for name in ["if", "while", "for", "switch"] {
+            let source = FIXTURE.replace(
+                "stack.push(seed);",
+                &format!("({{{name}(decoder){{stack.push(seed);"),
+            ) + &format!("}}}}).{name}(function(){{return 'x';}});");
+            assert_eq!(extract(&source), None, "{name}");
+        }
+    }
+    #[test]
+    fn visible_global_property_writes_invalidate_static_constants() {
+        for mutation in [
+            "globalThis.seed=867;",
+            "this.seed=867;",
+            "window['seed']=867;",
+            "window[\"seed\"]+=1;",
+        ] {
+            assert_eq!(
+                extract(
+                    &FIXTURE.replace("stack.push(seed);", &format!("{mutation}stack.push(seed);"))
+                ),
+                None,
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_methods_after_operators_are_not_control_headers() {
+        for prefix in [
+            "0||", "1&&", "null??", "!", "void ", "typeof ", "+", "false?0:",
+        ] {
+            let source = FIXTURE.replace(
+                "stack.push(seed);",
+                &format!("{prefix}{{if(decoder){{stack.push(seed);"),
+            ) + "}}.if(function(){return 'x';});";
+            assert_eq!(extract(&source), None, "{prefix}");
+        }
+    }
+    #[test]
+    fn additional_global_property_write_forms_invalidate_the_seed() {
+        for mutation in [
+            "for(this.seed of [867]){}",
+            "(globalThis.seed)=867;",
+            "++(window.seed);",
+            "--window.self.seed;",
+            "++((window['seed']));",
+        ] {
+            assert_eq!(
+                extract(
+                    &FIXTURE.replace("stack.push(seed);", &format!("{mutation}stack.push(seed);"))
+                ),
+                None,
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn ast_preserves_decoder_when_unrelated_names_are_shadowed() {
+        for prefix in [
+            "function other(){function decoder(){return 'x';}}",
+            "function other(String){return String;}",
+            "{let seed;}",
+            "obj.seed=867;",
+            "String(42);",
+        ] {
+            assert_eq!(
+                extract(&format!("{prefix}{FIXTURE}")).as_deref(),
+                Some(TOKEN),
+                "{prefix}"
+            );
+        }
+        assert_eq!(
+            extract(&format!("(function(){{{FIXTURE}window.seed=867;}})();")).as_deref(),
+            Some(TOKEN)
+        );
+    }
+    #[test]
+    fn ast_helpers_must_be_synchronous_scalar_functions() {
+        for source in [
+            FIXTURE.replace("negative=function(", "negative=async function("),
+            FIXTURE.replace("negative=function(", "negative=function*("),
+            FIXTURE.replace("sub=function(", "sub=async function("),
+            FIXTURE.replace("sub=function(", "sub=function*("),
+        ] {
+            assert_eq!(extract(&source), None);
+        }
+    }
+    #[test]
+    fn ast_rejects_visible_constructor_escapes_and_invalid_source() {
+        for prefix in [
+            "Object.defineProperty(String,'fromCharCode',{value:function(){return 65;}});",
+            "var alias=String;alias.fromCharCode=function(){return 65;};",
+        ] {
+            assert_eq!(extract(&format!("{prefix}{FIXTURE}")), None);
+        }
+        assert_eq!(
+            super::super::extract_bmak_ver(&format!("{FIXTURE}const broken = ;")),
+            None
+        );
+    }
+
+    #[test]
+    fn ast_seed_uses_the_complete_push_argument_expression() {
+        for expression in ["seed+1", "(seed+1)", "seed*2", "seed-1"] {
+            assert_eq!(
+                extract(&FIXTURE.replace("stack.push(seed)", &format!("stack.push({expression})"))),
+                None,
+                "{expression}"
+            );
+        }
+        assert_eq!(
+            extract(&FIXTURE.replace("stack.push(seed)", "stack.push(negative(-seed))")).as_deref(),
+            Some(TOKEN)
+        );
+    }
+    #[test]
+    fn ast_initializer_order_and_function_hoisting_are_distinct() {
+        assert_eq!(
+            extract(&(FIXTURE.replace("initial=945", "initial=late") + "var late=945;")),
+            None
+        );
+        let moved = FIXTURE.replace("var negative=function(n){return -n;};", "")
+            + "var negative=function(n){return -n;};";
+        assert_eq!(extract(&moved), None);
+        let hoisted = FIXTURE.replace("var negative=function(n){return -n;};", "")
+            + "function negative(n){return -n;}";
+        assert_eq!(extract(&hoisted).as_deref(), Some(TOKEN));
+    }
+
+    #[test]
+    fn ast_global_function_properties_do_not_alias_local_functions() {
+        for prefix in [
+            "window.decoder=function(){return 'x';};",
+            "globalThis.decoder=function(){return 'x';};",
+            "this.decoder=function(){return 'x';};",
+        ] {
+            assert_eq!(extract(&format!("{prefix}{FIXTURE}")), None, "{prefix}");
+            assert_eq!(
+                extract(&format!("(function(){{{prefix}{FIXTURE}}})();")).as_deref(),
+                Some(TOKEN)
+            );
+        }
+    }
+
+    #[test]
+    fn ast_seed_push_must_be_a_direct_straight_line_statement() {
+        for push in [
+            "if(0)stack.push(seed);",
+            "0&&stack.push(seed);",
+            "0?stack.push(seed):0;",
+            "while(0)stack.push(seed);",
+        ] {
+            assert_eq!(
+                extract(&FIXTURE.replace("stack.push(seed);", push)),
+                None,
+                "{push}"
+            );
+        }
+    }
+    #[test]
+    fn ast_state_dependencies_must_exist_before_the_call() {
+        let stack = FIXTURE.replace("var stack=[];", "") + "var stack=[];";
+        assert_eq!(extract(&stack), None);
+        let table_start = FIXTURE.find("var table=").unwrap();
+        let table_end = table_start + FIXTURE[table_start..].find(';').unwrap() + 1;
+        let table = &FIXTURE[table_start..table_end];
+        let moved = FIXTURE.replace(table, "") + table;
+        assert_eq!(extract(&moved), None);
+        assert_eq!(
+            extract(&format!("{{function negative(n){{return n;}}}}{FIXTURE}")),
+            None
+        );
+    }
+    #[test]
+    fn dispatcher_lookup_handles_many_siblings_and_nested_functions() {
+        let mut noise = String::new();
+        for i in 0..1500 {
+            noise.push_str(&format!("function unused{i}(){{return [0];}}"));
+        }
+        assert_eq!(extract(&noise), None);
+        let source = include_str!("fixtures/homedepot_fresh_return_delta.js");
+        let wrapped = format!("{noise}function container(){{{source}}}container();");
+        assert_eq!(extract(&wrapped), extract(source));
+        assert!(extract(source).is_some());
+    }
+    #[test]
+    fn many_factory_owners_share_one_supported_table() {
+        let source = include_str!("fixtures/homedepot_fresh_return_delta.js");
+        let mut changed = source.to_owned();
+        for i in 0..512 {
+            changed.push_str(&format!("var alias{i}=factory(state,[]);"));
+        }
+        assert_eq!(extract(&changed), extract(source));
+        assert!(extract(source).is_some());
+    }
+    #[test]
+    fn delta_candidate_budget_rejects_partial_matching() {
+        let ast = Analysis::parse(FIXTURE).unwrap();
+        assert_eq!(extract_with_budget(FIXTURE, &ast, 0), None);
+        assert_eq!(extract(FIXTURE).as_deref(), Some(TOKEN));
+    }
+
+    #[test]
+    fn indexed_outside_dependency_checks_preserve_read_only_and_stack_rules() {
+        let read_only = format!("{FIXTURE}{}", "table[0];".repeat(4096));
+        assert_eq!(extract(&read_only).as_deref(), Some(TOKEN));
+        let extra_stack_reads = format!("{FIXTURE}{}", "stack[0];".repeat(4096));
+        assert_eq!(extract(&extra_stack_reads), None);
+    }
+
+    #[test]
+    fn repeated_valid_apply_calls_use_the_same_proven_seed_and_version() {
+        let source = format!(
+            "{FIXTURE}{}",
+            "decoder.apply(null,[size,0,0,initial,0,start]);".repeat(1024)
+        );
+        assert_eq!(extract(&source).as_deref(), Some(TOKEN));
     }
 }
