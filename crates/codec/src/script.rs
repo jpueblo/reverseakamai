@@ -9,6 +9,14 @@ use std::fmt::Write as _;
 use native_payload::template::parse_js_string_array;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[path = "delta_version.rs"]
+mod delta_version;
+#[path = "numeric_constants.rs"]
+mod numeric_constants;
+#[path = "literal_arrays.rs"]
+mod literal_arrays;
+#[path = "numeric_tables.rs"]
+mod numeric_tables;
 /// Coarse, heuristic script family for build inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScriptFamily {
@@ -136,147 +144,115 @@ fn count_catch_splice_markers(source: &str) -> usize {
     count
 }
 
-/// Statically extract the `bmak` v3 `shuffle_key` (`s8[10]`) from the digit-ciphered
-/// `s8` constant array (`4294967295.000000`, `8388607.000000`, `8888888`).
+/// Extract a key from supported digit-cipher tables. Absolute indexes and
+/// variable names change between builds. Prefer a bound cipher-key initializer;
+/// lazy accessor layouts use the unique 8888888 sentinel pair as a fallback.
+/// Require three consistent numeric anchors, including across split pools.
 pub fn extract_bmak_shuffle_key(source: &str) -> Option<u32> {
-    let mut cursor = 0;
-    while let Some(rel) = source[cursor..].find("[['") {
-        let start = cursor + rel + 1;
-        cursor = start + 2;
-        let slice = &source[start..source.len().min(start + 2048)];
-        let arr = parse_js_string_array(slice);
-        if arr.len() < 23 {
-            continue;
-        }
-        let s4 = arr[4].as_bytes();
-        let s6 = arr[6].as_bytes();
-        let s9 = arr[9].as_bytes();
-        if s4.len() != 17 || s6.len() != 14 || s9.len() != 7 || !s9.iter().all(|&b| b == s9[0]) {
-            continue;
-        }
-        let zero_ch = s4[11];
-        if !s4[11..17].iter().all(|&b| b == zero_ch) {
-            continue;
-        }
-        let mut map = [255u8; 256];
-        map[zero_ch as usize] = 0;
-        map[s4[1] as usize] = 2;
-        map[s6[1] as usize] = 3;
-        map[s4[0] as usize] = 4;
-        map[s4[9] as usize] = 5;
-        map[s4[5] as usize] = 6;
-        map[s4[6] as usize] = 7;
-        map[s6[0] as usize] = 8;
-        map[s4[2] as usize] = 9;
-        for item in &arr {
-            let b = item.as_bytes();
-            if b.len() == 4
-                && b[1] == zero_ch
-                && b[2] == zero_ch
-                && b[3] == zero_ch
-                && map[b[0] as usize] == 255
-            {
-                map[b[0] as usize] = 1;
-                break;
-            }
-        }
-        let mut value = 0u32;
-        for &ch in arr[10].as_bytes() {
-            let digit = map[ch as usize];
-            if digit > 9 {
-                return None;
-            }
-            value = value.checked_mul(10)?.checked_add(u32::from(digit))?;
-        }
-        return Some(value);
+    numeric_tables::extract_shuffle_key(source)
+}
+
+fn bind_numeric_anchor(map: &[u8; 256], encoded: &str, expected: &[u8]) -> Option<[u8; 256]> {
+    if !encoded.is_ascii() || encoded.len() != expected.len() {
+        return None;
     }
-    None
+    let mut result = *map;
+    for (glyph, plain) in encoded.bytes().zip(expected.iter().copied()) {
+        let value = if plain == b'.' { 10 } else { plain - b'0' };
+        let slot = result[glyph as usize];
+        if slot != 255 && slot != value {
+            return None;
+        }
+        if result
+            .iter()
+            .enumerate()
+            .any(|(other, v)| *v == value && other != glyph as usize)
+        {
+            return None;
+        }
+        result[glyph as usize] = value;
+    }
+    Some(result)
+}
+
+fn decode_numeric_key(encoded: &str, map: &[u8; 256]) -> Option<u32> {
+    if encoded.is_empty() || !encoded.is_ascii() {
+        return None;
+    }
+    encoded.bytes().try_fold(0u32, |value, glyph| {
+        let digit = map[glyph as usize];
+        if digit > 9 {
+            return None;
+        }
+        value.checked_mul(10)?.checked_add(u32::from(digit))
+    })
 }
 
 /// Statically extract the 44-character Base64 `ver` constant from a `bmak` v3 script's
 /// XOR-encoded string table arrays.
 pub fn extract_bmak_ver(source: &str) -> Option<String> {
-    for marker in ["return [\"", "W2=[\""] {
-        let mut cursor = 0;
-        while let Some(rel) = source[cursor..].find(marker) {
-            let bracket = cursor + rel + marker.len() - 2;
-            cursor = bracket + 2;
-            let Some(end_rel) = source[bracket..].find("];") else {
-                continue;
-            };
-            if !(500..=250_000).contains(&end_rel) {
-                continue;
-            }
-            let arr = parse_js_string_array(&source[bracket..=bracket + end_rel]);
-            let len44: Vec<&str> = arr
-                .iter()
-                .map(String::as_str)
-                .filter(|s| s.len() == 44)
-                .collect();
-            let len20: Vec<&str> = arr
-                .iter()
-                .map(String::as_str)
-                .filter(|s| s.len() == 20)
-                .collect();
-            if len44.is_empty() || len20.is_empty() {
-                continue;
-            }
-            for &qat in &len44 {
-                let qbytes: Vec<u8> = qat.chars().map(|c| c as u8).collect();
-                if qbytes.len() != 44 {
-                    continue;
-                }
-                for &s20 in &len20 {
-                    let s20_bytes: Vec<u8> = s20.chars().map(|c| c as u8).collect();
-                    if s20_bytes.len() != 20 {
-                        continue;
-                    }
-                    for master in &arr {
-                        let mbytes: Vec<u8> = master.chars().map(|c| c as u8).collect();
-                        if mbytes.len() < 20 || std::ptr::eq(master.as_str(), s20) {
-                            continue;
-                        }
-                        for d9w in 0..=mbytes.len() - 20 {
-                            let mut z5t = [0u8; 20];
-                            let mut ascii_ok = true;
-                            for k in 0..20 {
-                                let b = s20_bytes[k] ^ mbytes[d9w + k];
-                                if !(32..=126).contains(&b) {
-                                    ascii_ok = false;
-                                    break;
-                                }
-                                z5t[k] = b;
-                            }
-                            if !ascii_ok {
+    delta_version::extract(source).or_else(|| extract_xor_ver(source))
+}
+
+fn extract_xor_ver(source: &str) -> Option<String> {
+    let mut candidates = std::collections::BTreeSet::new();
+    for literal in literal_arrays::string_arrays(source) {
+        let arr: Vec<Vec<u8>> = parse_js_string_array(literal)
+            .iter()
+            .filter_map(|s| s.chars().map(|c| u8::try_from(u32::from(c)).ok()).collect())
+            .collect();
+        for cipher in arr.iter().filter(|s| s.len() == 44) {
+            for seed in arr.iter().filter(|s| (8..=32).contains(&s.len())) {
+                for master in arr
+                    .iter()
+                    .filter(|s| !s.is_empty() && s.len() <= 256 && !std::ptr::eq(*s, seed))
+                {
+                    for offset in 0..master.len() {
+                        for shift in 0..seed.len() {
+                            let last = (43 + shift) % seed.len();
+                            if seed[last] ^ master[(offset + last) % master.len()]
+                                != cipher[43] ^ b'='
+                            {
                                 continue;
                             }
-                            let needed_last = qbytes[43] ^ b'=';
-                            for shift in 0..20 {
-                                if z5t[(43 + shift) % 20] != needed_last {
-                                    continue;
+                            let mut out = [0; 44];
+                            let mut valid = true;
+                            for i in 0..43 {
+                                let k = (i + shift) % seed.len();
+                                let c = cipher[i] ^ seed[k] ^ master[(offset + k) % master.len()];
+                                if !(c.is_ascii_alphanumeric() || c == b'+' || c == b'/') {
+                                    valid = false;
+                                    break;
                                 }
-                                let mut out = [0u8; 44];
-                                out[43] = b'=';
-                                let mut valid = true;
-                                for i in 0..43 {
-                                    let ch = qbytes[i] ^ z5t[(i + shift) % 20];
-                                    if !(ch.is_ascii_alphanumeric() || ch == b'+' || ch == b'/') {
-                                        valid = false;
-                                        break;
-                                    }
-                                    out[i] = ch;
-                                }
-                                if valid {
-                                    return String::from_utf8(out.to_vec()).ok();
-                                }
+                                out[i] = c;
                             }
+                            if !valid {
+                                continue;
+                            }
+                            let c = out[42];
+                            let sextet = match c {
+                                b'A'..=b'Z' => c - b'A',
+                                b'a'..=b'z' => c - b'a' + 26,
+                                b'0'..=b'9' => c - b'0' + 52,
+                                b'+' => 62,
+                                _ => 63,
+                            };
+                            if sextet % 4 != 0 {
+                                continue;
+                            }
+                            out[43] = b'=';
+                            candidates.insert(String::from_utf8(out.to_vec()).ok()?);
                         }
                     }
                 }
             }
         }
     }
-    None
+    if candidates.len() == 1 {
+        candidates.into_iter().next()
+    } else {
+        None
+    }
 }
 
 /// Count quoted/template literals while ignoring comments. Lengths are source
@@ -398,4 +374,10 @@ mod tests {
         let snippet = "s8=fA(G9,[['CAr3qAAAAAA','C','r5','b3Mrf','C5rCrbM5r3qAAAAAA','C595bbf','9f99bAMqAAAAAA','f5','b33f3qAAAAAA','9999999','bC3f9rI','IA5C','5AC9','fbAA','CArb','9Ir5','Ibf9C','f5Mb9','IfIAM5','5','I3','I5AA','IAAA'],0]);";
         assert_eq!(extract_bmak_shuffle_key(snippet), Some(6_453_891));
     }
+    #[test]
+    fn extracts_captured_homedepot_436427_shuffle_key() {
+        let source = include_str!("fixtures/homedepot_436427_numeric.js");
+        assert_eq!(extract_bmak_shuffle_key(source), Some(8_846_455));
+    }
+
 }
