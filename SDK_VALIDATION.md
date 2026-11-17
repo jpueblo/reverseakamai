@@ -1,9 +1,10 @@
 # AD-11054 SDK integration validation
 
-This branch combines draft PR #1 (Windows device OS correction) and draft PR #2
-(HomeDepot key/version extraction), including the Copilot follow-up fixes.
+This branch combines the latest reviewed draft PR #1 (Windows device OS correction)
+and draft PR #2 (HomeDepot key/version extraction and AST binding analysis).
 The independent implementation details remain in WINDOWS_PROFILE_FIX.md and
-CODEC_PARSER_FIXES.md. The SDK and SBSD submission guard are unchanged.
+CODEC_PARSER_FIXES.md. Session/submission behavior and the SBSD guard are unchanged;
+the SDK cache lookup now uses the cheap source-hash helper from PR #2.
 
 ## Complete Chrome155 Windows11 capture
 
@@ -38,9 +39,46 @@ Its key and version are computed from their parameter/delta tables, not cached.
 The opaque conversion/dispatcher layout is deliberately not generalized to
 unknown scripts. Any source-byte change disables that compatibility route.
 
-All 51 codec tests and four Python executable/loopback tests pass. Full fresh
+All 124 codec tests and four Python executable/loopback tests pass. Full fresh
 and legacy saved scripts were checked, including mutated legacy rejection.
 Copilot regressions and the SBSD guard remain intact.
+
+## Latest integration refresh â€” 2026-11-18
+
+Merged reviewed PR #1 head `74fc8757f21c568e61e06626d8a8d8fb4c525990` (already included) and
+PR #2 head `74724d5ded07b57796eb40e5d47e43953ef3a03f`. The integration merge is
+`eba23bfda2dfeab7b28600c72ad51b09f364c348`. The latest codec uses AST binding/write identities,
+compact bounded lookup plans, indexed source/dependency evidence, bounded
+anchor/XOR/delta matching and shared delta-table storage. The source-hash cache
+helper is the only SDK implementation change. Implementation and review limits
+remain in the two separate PR documents.
+
+The complete saved Chrome155 Windows11 environment and its matching template
+were validated again, without a browser or proxy. The template was rebuilt
+from both original sensor POST bodies using static extraction only and equals
+the preserved template JSON. Both ciphertexts round-trip exactly, three encoded
+posts round-trip, and all 28 captured mature-worker fields are preserved.
+Checked identity, geometry, hardware and WebGL fields match the saved
+environment, including Win32/Windows and platformVersion 19.0.0.
+Original saved environment/template/header/script files are unchanged.
+
+Current checks passed: seven native-payload tests against the actual integration
+dependency; 124 codec tests plus the explicit private full XOR test; five Rust
+browser/worker compatibility checks; four executable/numeric-localhost Python
+tests; offline SDK/template/validator builds; locked offline Cargo metadata;
+fresh/legacy build checks and modified-legacy rejection. The harness's 33 checked
+codec/native files match this branch byte-for-byte, and SDK core matches after
+removing the existing capture hooks. External traffic is denied by default;
+incomplete identities reject before request logging. The SBSD guard is intact.
+
+The local pointer `chrome155-saved-template-current.json` now identifies the
+refreshed template and private report. Raw data is outside Git. Validation still
+uses explicit Chrome154 transport approximation and historical captured
+measurements; it does not validate native fallback telemetry or establish live
+sensor acceptance/GraphQL access. The root workspace's unchanged SHA assembly
+feature settings can still block a standalone full-workspace MSVC build; the
+instrumented harness retains its existing Windows build configuration.
+Live browser, proxy and SDK tests remain paused.
 
 ## Remaining limits
 
@@ -66,8 +104,8 @@ in restricted local evidence storage, outside Git. The local harness pointer
 chrome155-saved-template-current.json identifies the current private files and
 redacted reports. The earlier Chrome154 template pointer is preserved.
 
-Live SDK tests remain paused. The SBSD guard is unchanged. Both Copilot comments
-have reproduction/fix/test replies on PR #2. The .vs/ ignore rule is present on
+Live SDK tests remain paused. The SBSD guard is unchanged. All six Copilot threads
+have reproduction/fix/test follow-up replies on PR #2. The .vs/ ignore rule is present on
 all three AD-11054 branches.
 
 ## Validation incident and offline network gate
