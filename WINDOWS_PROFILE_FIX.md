@@ -40,7 +40,7 @@ of every workspace package on every platform, or live site acceptance.
 ## Related work and limits
 
 Codec extraction changes are separate, on
-[`codex/homedepot-shuffle-key`](https://github.com/jpueblo/reverseakamai/tree/codex/homedepot-shuffle-key).
+[`AD-11054/homedepot-shuffle-key`](https://github.com/jpueblo/reverseakamai/tree/AD-11054/homedepot-shuffle-key).
 Its `CODEC_PARSER_FIXES.md` documents shuffle-key, version-token, lexer,
 constant-expression, ambiguity, and fixture changes.
 
