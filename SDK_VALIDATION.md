@@ -1,70 +1,62 @@
 # AD-11054 SDK integration validation
 
-This integration branch combines two independent draft PRs without merging
-either into main:
+This branch combines draft PR #1 (Windows device OS correction) and draft PR #2
+(HomeDepot key/version extraction), including the Copilot follow-up fixes.
+The independent implementation details remain in WINDOWS_PROFILE_FIX.md and
+CODEC_PARSER_FIXES.md. The SDK and SBSD submission guard are unchanged.
 
-- [Windows device OS correction, PR #1](https://github.com/jpueblo/reverseakamai/pull/1)
-- [HomeDepot codec parser fixes, PR #2](https://github.com/jpueblo/reverseakamai/pull/2)
+## Complete Chrome155 Windows11 capture
 
-`WINDOWS_PROFILE_FIX.md` and `CODEC_PARSER_FIXES.md` document their individual
-changes. Experimental Chrome155+ transport selection remains in the local
-instrumented harness; no exact Chrome155 transport preset is introduced here.
+A fresh Kameleo profile loaded the homepage once with a 30-second passive
+observation window. Three direct browser snapshots recorded the complete
+required environment, including colorDepth 24, pixelDepth 24, devicePixelRatio 1,
+outerHeight 1440, and platformVersion 19.0.0. This supersedes the earlier partial
+environment preparation; no synthetic geometry was supplied.
 
-## Saved Chrome155 Windows11 preparation
+The matching captured script SHA256 is
+5d7b4b2851c18a689d1a72085d95590167f3312b151acebab778ac9b0a3e2c29.
+Two captured sensor stages agree with the directly observed UA, client hints,
+geometry, language, timezone, CPU count, memory, and WebGL. The mature stage
+contains 28 worker fields. Both ciphertexts decode and re-encode exactly, and
+three offline template encodings round-trip successfully. Rust profile/template
+validation passes with no network requests. Captured clocks and measurements
+remain historical data, not freshly synthesized browser telemetry.
 
-The source is the second captured Chrome155 browser session from the saved
-homepage pair. It contains one matching bmak script and two sensor POST bodies.
-The decoded mature stage has 28 worker fields. Runtime identity, outgoing
-headers, worker UA, low/high-entropy client hints, and both sensor stages agree
-on Chrome155, Windows/Win32, and platformVersion 19.0.0.
+## Outstanding blockers
 
-The private template is bound to script SHA256
-`d30fd6d7aa173a0991be490f904fa59fdd363257a28b507306b8570f81a53fc3`.
-Both captured ciphertexts decode and re-encode exactly. Three offline encodings
-round-trip successfully; the third SDK post reuses the last captured stage.
-Captured measurements, clocks, and non-build fields are preserved. This does
-not refresh browser telemetry or establish live acceptance.
+The template uses a key recovered offline from captured framing and verified
+against both ciphertexts. Static extraction does not yet support this script's
+layout. Before review hardening the parser selected an unrelated sentinel;
+it now rejects the layout. This is not reported as static extractor support.
 
-The environment JSON uses values supported by saved evidence: runtime UA and
-client hints; sensor screen/available-screen dimensions and inner dimensions/
-outer width; worker language, timezone, CPU count, memory, and WebGL identity.
-The provenance record documents each source and marks unknown fields explicitly.
-No synthetic geometry is added to this capture-backed environment.
+All 48 codec unit tests pass, including the two Copilot regressions. The stricter
+complete-initializer rule also rejects an older loopback fixture's complex
+initializer. That legacy SDK solve fails closed with a missing shuffle key;
+it is not reported as passing. Additional evidence-backed recognition is needed.
 
-### Incomplete environment: live tests remain paused
+Direct measurement also shows deviceMemory 16 and captured worker s035 16.
+The earlier assumption of dividing s035 by four was wrong for this capture.
+The native fallback template constructor currently multiplies memory by four;
+its telemetry is not validated by successful replay of the captured template.
 
-The captures do not contain a complete capture-env snapshot. These fields
-remain unverified and are omitted:
+Exact Chrome155+ TLS/HTTP2 profiles are still unavailable in the pinned transport
+library. Chrome154 approximation remains an explicit, experimental local-harness
+option. No live SDK solve is ready or authorized by this validation.
 
-- `screen.colorDepth`
-- `screen.pixelDepth`
-- `screen.devicePixelRatio`
-- `window.outerHeight`
+## Capture results and evidence handling
 
-The environment therefore has `captureCompleteness.complete=false` and is not
-live-ready. The harness rejects it before live requests. Numeric loopback-only
-preview is allowed so the unchanged captured template can be validated without
-claiming a complete native browser environment. Native fallback defaults are
-not evidence for the missing fields. A complete future capture would be needed
-before using this environment for live work; none was requested or run here.
+The homepage and six automatic GraphQL responses returned HTTP200. All six
+GraphQL response bodies were retained. Browser traffic nevertheless recorded
+98 tunnel failures and nine capture gaps; healthy before/after probes and a
+consistent exit hash do not negate those errors. A prior setup attempt returned
+HTTP472 node_tunnel_failed before creating any browser; it is preserved separately.
 
-Raw sensor bodies, decoded templates, environment JSON, cookies, proxy details,
-and traffic logs stay outside Git in restricted local evidence storage. The
-local harness pointer is `chrome155-saved-template-current.json`; it identifies
-the private files and redacted reports. The earlier Chrome154 template pointer
-is preserved.
+The one browser profile was stopped/deleted and temporary proxy credentials
+removed. Raw environment, traffic, decoded sensor posts and template files remain
+in restricted local evidence storage, outside Git. The local harness pointer
+chrome155-saved-template-current.json identifies the current private files and
+redacted reports. The earlier Chrome154 template pointer is preserved.
 
-## Offline checks
-
-- The two saved ciphertexts and three encoded posts round-trip exactly.
-- The actual SDK loopback solve submits three sensors, reuses the last captured
-  stage, preserves the source template, and skips background SBSD under the
-  unchanged guard. UA and language match the saved sensor request headers.
-- An incomplete environment is rejected before any live request or traffic log.
-- Exact Chrome155+ transport selection is rejected. Loopback preview explicitly
-  uses `chrome154-approximation`, without asserting transport equivalence.
-- The existing Windows/macOS dependency regression, codec suite, compatibility
-  checks, and executable/loopback regressions are retained and run offline.
-
-There are no HomeDepot/proxy requests or browser launches in this validation.
-GitHub operations only create the requested draft PRs and integration branch.
+Live SDK tests remain paused. The SBSD guard is unchanged. Both Copilot comments
+have reproduction/fix/test replies on PR #2. The .vs/ ignore rule is present on
+all three AD-11054 branches.
