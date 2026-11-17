@@ -440,7 +440,7 @@ impl AkamaiClient {
         let mut post_status = sbsd_status;
 
         if !script.is_empty() {
-            let script_sha256 = akamai_codec::script::analyze_script(&script).sha256;
+            let script_sha256 = akamai_codec::script::source_sha256(&script);
             let tpl = if let Some(explicit) = &options.template {
                 explicit.clone()
             } else if let Some(cached) = self.templates.get(&script_sha256) {
