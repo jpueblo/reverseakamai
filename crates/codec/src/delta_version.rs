@@ -429,6 +429,7 @@ pub(super) fn extract(source: &str) -> Option<String> {
     }
     let known = constants(&t, &minus);
     let mut tables = Vec::new();
+    let allow_legacy = super::verified_legacy_layout(source);
     let mut bound_tables = Vec::new();
     for i in 0..t.len().saturating_sub(2) {
         let (array_start, owners) = if ident(t[i]) && t[i + 1] == "=" && t[i + 2] == "[" {
@@ -461,6 +462,40 @@ pub(super) fn extract(source: &str) -> Option<String> {
         if a.len() >= 44 {
             for owner in owners {
                 bound_tables.push((owner, a.clone()));
+            }
+        }
+    }
+    // The historical full build uses dispatcher wrappers that are outside the
+    // general function-binding recognizer. Retain its statically decoded table
+    // and stack only after exact source verification; never on unknown scripts.
+    let mut legacy_tables = Vec::new();
+    if allow_legacy {
+        for (owner, a) in &bound_tables {
+            for fallback in t
+                .windows(4)
+                .filter(|w| w[1] == "=" && w[2] == *owner && w[3] == ";")
+            {
+                for step in t.windows(7).filter(|w| {
+                    w[1] == "+=" && w[2] == fallback[0] && w[3] == "[" && w[5..7] == ["]", ";"]
+                }) {
+                    for seed in t.windows(19) {
+                        if seed[0] == step[0]
+                            && seed[1] == "="
+                            && subtract.contains(seed[2])
+                            && seed[3] == "("
+                            && seed[5] == ","
+                            && seed[7] == "["
+                            && seed[8] == seed[2]
+                            && seed[9] == "("
+                            && seed[10] == seed[6]
+                            && seed[11..14] == [".", "length", ","]
+                            && known.get(seed[14]) == Some(&1)
+                            && seed[15..19] == [")", "]", ")", ";"]
+                        {
+                            legacy_tables.push((a.clone(), seed[6]));
+                        }
+                    }
+                }
             }
         }
     }
@@ -564,6 +599,19 @@ pub(super) fn extract(source: &str) -> Option<String> {
         let Some((stack, Some(seed))) = scope.iter().rev().find_map(|n| *n) else {
             continue;
         };
+        if allow_legacy {
+            if let [Some(44), Some(initial), Some(index), _] = args.as_slice() {
+                if let Some(initial) = initial.checked_sub(seed) {
+                    for (table, decoder_stack) in &legacy_tables {
+                        if *decoder_stack == stack {
+                            if let Some(token) = decode(table, *index, initial) {
+                                candidates.insert(token);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         for (
             table,
             decoder_stack,

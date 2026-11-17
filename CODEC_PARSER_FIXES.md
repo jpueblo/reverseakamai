@@ -57,7 +57,7 @@ Mixed-expression and incomplete arrays are rejected.
 
 ## Saved fixtures and offline verification
 
-Eight minimized JavaScript fixtures cover captured layouts associated with
+Ten minimized JavaScript fixtures cover captured layouts associated with
 `436427`, `36bb`, split numeric pools, registered getter pools, returned delta
 tables, the earlier delta layout, and the `217bb3` four-argument lookup. These
 are parser fragments, not full traffic logs, cookies, or proxy configurations.
@@ -67,7 +67,7 @@ seeds, unknown references, truncated arrays, decoy literals/comments/regexes,
 conflicting keys, nested indexes, negation, and recursion limits. The original
 shuffle-key snippet remains covered.
 
-All 48 codec unit tests passed, including the review regressions below.
+All 51 codec unit tests passed, including the review regressions below.
 
 Validation command: `cargo test --offline -p akamai-codec --lib`, using the
 existing Windows instrumented harness. The parser source and fixtures are
@@ -102,3 +102,32 @@ Only apply calls to that recognized function with the correct argument mapping
 are decoded. Unrelated/member callees, reassigned decoders, conflicting function
 names, and changed argument positions fail closed. This remains a constrained
 recognizer and may reject new layouts until they have dedicated evidence/tests.
+
+## Fresh Chrome155 registration and legacy loopback restoration
+
+The fresh Chrome155 build uses a three-slot numeric registration header:
+`[u32_max, LCG_multiplier, build_key]`. The earlier supported header was
+`[u32_max, LCG_multiplier, mask, build_key]`. Both are recognized statically;
+the mask is never selected as a build key. Registration evidence outranks an
+unrelated sentinel, while malformed headers, conflicting registered values,
+and a transformed initializer referencing the registered key fail closed.
+The new 5d7 fixture and mutation tests cover this layout.
+
+The historical 217bb3 loopback script has an opaque global conversion and
+state-dispatcher version decoder outside the general recognizers. Its bounded
+compatibility route requires exact SHA256
+`217bb3efd6f16f02ef7bb2336f21593e6eb8af15ccdf59c1f764a75b1b9f8e29`.
+The shuffle key is still read from the full LCG parameter sequence (multiplier,
+32-bit mask, increment, 23-bit mask, sentinel, key), and the version is decoded
+from its saved delta tables. Neither value is hard-coded. Any source-byte
+change disables this route; unknown scripts retain the stricter initializer
+and decoder-identity checks. This is intentionally exact-build compatibility,
+not general support for every obfuscated global conversion.
+
+Verification against the complete private captures finds the fresh key
+8,682,175 and legacy key 4,881,225. The fresh statically extracted key decodes
+and re-encodes both captured ciphertexts exactly, without recovery input.
+The unchanged legacy loopback solve and fresh captured-template loopback both
+pass, along with executable rejection tests. Mutated legacy scripts are rejected.
+No captured full scripts, decoded sensor bodies, or environment files are added
+to this branch.
