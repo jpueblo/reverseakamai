@@ -22,26 +22,35 @@ three offline template encodings round-trip successfully. Rust profile/template
 validation passes with no network requests. Captured clocks and measurements
 remain historical data, not freshly synthesized browser telemetry.
 
-## Outstanding blockers
+## Static extraction and loopback restoration
 
-The template uses a key recovered offline from captured framing and verified
-against both ciphertexts. Static extraction does not yet support this script's
-layout. Before review hardening the parser selected an unrelated sentinel;
-it now rejects the layout. This is not reported as static extractor support.
+Static extraction now supports the fresh Chrome155 registration ABI
+[u32_max, multiplier, key] as well as [u32_max, multiplier, mask, key]. The fresh
+key is selected from the registration rather than an unrelated sentinel.
+Malformed/conflicting registrations and transformed key operands fail closed.
+Both captured ciphertexts round-trip with static extraction only; recovery input
+is no longer required. The fresh captured-template SDK loopback solve passes.
 
-All 48 codec unit tests pass, including the two Copilot regressions. The stricter
-complete-initializer rule also rejects an older loopback fixture's complex
-initializer. That legacy SDK solve fails closed with a missing shuffle key;
-it is not reported as passing. Additional evidence-backed recognition is needed.
+The unchanged original legacy loopback test is restored through exact-build
+compatibility for SHA256
+217bb3efd6f16f02ef7bb2336f21593e6eb8af15ccdf59c1f764a75b1b9f8e29.
+Its key and version are computed from their parameter/delta tables, not cached.
+The opaque conversion/dispatcher layout is deliberately not generalized to
+unknown scripts. Any source-byte change disables that compatibility route.
 
-Direct measurement also shows deviceMemory 16 and captured worker s035 16.
-The earlier assumption of dividing s035 by four was wrong for this capture.
-The native fallback template constructor currently multiplies memory by four;
-its telemetry is not validated by successful replay of the captured template.
+All 51 codec tests and four Python executable/loopback tests pass. Full fresh
+and legacy saved scripts were checked, including mutated legacy rejection.
+Copilot regressions and the SBSD guard remain intact.
+
+## Remaining limits
+
+Direct measurement shows deviceMemory 16 and captured worker s035 16. The
+native fallback constructor currently multiplies device memory by four; that
+separate telemetry issue is not corrected by the shuffle extraction fix.
 
 Exact Chrome155+ TLS/HTTP2 profiles are still unavailable in the pinned transport
 library. Chrome154 approximation remains an explicit, experimental local-harness
-option. No live SDK solve is ready or authorized by this validation.
+option. No live SDK solve is authorized by this validation.
 
 ## Capture results and evidence handling
 
@@ -60,3 +69,13 @@ redacted reports. The earlier Chrome154 template pointer is preserved.
 Live SDK tests remain paused. The SBSD guard is unchanged. Both Copilot comments
 have reproduction/fix/test replies on PR #2. The .vs/ ignore rule is present on
 all three AD-11054 branches.
+
+## Validation incident and offline network gate
+
+A stale installed negative test unexpectedly made one HomeDepot SDK GET, which
+returned HTTP403; it submitted no sensor posts. This violated the SDK pause and
+is preserved in the private validation evidence. The installed test was
+corrected and output directories made unique. The generated SDK adapter now
+denies external network traffic by default, with a regression verifying rejection
+before request logs. Subsequent checks were localhost-only. Live SDK tests remain
+paused; future live use requires an explicit network-gate change and authorization.
