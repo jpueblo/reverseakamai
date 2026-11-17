@@ -81,7 +81,7 @@ recognition rules rather than a general JavaScript interpreter.
 This branch contains codec extraction changes and parser fixtures. The Windows
 `DeviceProfile.os_platform` correction, vendored dependency, MSVC dependency
 feature adjustment, and `.vs/` ignore rule are on
-[`codex/windows-device-os`](https://github.com/jpueblo/reverseakamai/tree/codex/windows-device-os),
+[`AD-11054/windows-device-os`](https://github.com/jpueblo/reverseakamai/tree/AD-11054/windows-device-os),
 documented in `WINDOWS_PROFILE_FIX.md`.
 
 The SBSD guard, sensor submission policy, SDK request workflow, and interpreter
