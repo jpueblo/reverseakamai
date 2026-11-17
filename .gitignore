@@ -9,3 +9,4 @@
 /*.HAR
 .DS_Store
 **/tests/
+.vs/
