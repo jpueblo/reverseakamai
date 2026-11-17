@@ -1,7 +1,7 @@
 //! Digit-cipher tables may be split across arrays. Bind numeric pool members
 //! to a key initializer used as the second member of a cipher-key pair.
 //! This recognizer never executes a source function or guesses a numeric key.
-use super::{bind_numeric_anchor, decode_numeric_key, numeric_constants, literal_arrays};
+use super::{bind_numeric_anchor, decode_numeric_key, literal_arrays, numeric_constants};
 use native_payload::template::parse_js_string_array;
 use std::collections::{BTreeMap, BTreeSet};
 fn number(s: &str, constants: &BTreeMap<String, i64>) -> Option<usize> {
@@ -9,39 +9,80 @@ fn number(s: &str, constants: &BTreeMap<String, i64>) -> Option<usize> {
         .ok()
         .or_else(|| usize::try_from(*constants.get(s)?).ok())
 }
-// Only deduplicate a repeated lookup when it is the same entire expression
-// on both sides of an outer conditional, not an arithmetic combination.
-fn repeated_conditional(t: &[&str], unary_helpers: &BTreeSet<&str>) -> bool {
-    let mut depth = 0i32;
+// Validate the complete value-producing initializer, not merely a lookup
+// operand somewhere inside it. Unknown calls and arithmetic are not transparent.
+fn preserving_lookup(
+    t: &[&str],
+    pools: &BTreeMap<&str, &Vec<String>>,
+    constants: &BTreeMap<String, i64>,
+    map: &[u8; 256],
+    depth: usize,
+) -> Option<u32> {
+    if depth > 32 {
+        return None;
+    }
+    let mut t = t;
+    while t.first() == Some(&"(") && t.last() == Some(&")") {
+        let mut level = 0i32;
+        let mut whole = true;
+        for (i, token) in t.iter().enumerate() {
+            match *token {
+                "(" => level += 1,
+                ")" => level -= 1,
+                _ => {}
+            }
+            if level == 0 && i + 1 < t.len() {
+                whole = false;
+                break;
+            }
+        }
+        if !whole {
+            break;
+        }
+        t = &t[1..t.len() - 1];
+    }
+    let mut level = 0i32;
     let mut question = None;
-    let mut nested = 0usize;
     for (i, token) in t.iter().enumerate() {
         match *token {
-            "(" | "[" | "{" => depth += 1,
-            ")" | "]" | "}" => depth -= 1,
-            "?" if depth == 0 => {
-                if question.is_none() {
-                    question = Some(i);
-                } else {
-                    nested += 1;
+            "(" | "[" | "{" => level += 1,
+            ")" | "]" | "}" => level -= 1,
+            "?" if level == 0 => {
+                if question.is_some() {
+                    return None;
                 }
+                question = Some(i);
             }
-            ":" if depth == 0 && question.is_some() => {
-                if nested > 0 {
-                    nested -= 1;
-                    continue;
+            ":" if level == 0 => {
+                let q = question?;
+                // Only a simple, side-effect-free condition is supported.
+                if q != 1 {
+                    return None;
                 }
-                let left = &t[question.unwrap() + 1..i];
-                let right = &t[i + 1..];
-                return !left.is_empty()
-                    && left == right
-                    && !matches!(left[0], "-" | "!" | "~")
-                    && !unary_helpers.contains(left[0]);
+                let a = preserving_lookup(&t[q + 1..i], pools, constants, map, depth + 1)?;
+                let b = preserving_lookup(&t[i + 1..], pools, constants, map, depth + 1)?;
+                return (a == b).then_some(a);
             }
             _ => {}
         }
     }
-    false
+    if t.len() >= 4 && t[..2] == ["parseInt", "("] && t.last() == Some(&")") {
+        let args = &t[2..t.len() - 1];
+        let lookup = if args.len() == 6 && args[4..] == [",", "10"] {
+            &args[..4]
+        } else {
+            args
+        };
+        // parseInt of one supported pool lookup is value-preserving here.
+        if lookup.len() != 4 {
+            return None;
+        }
+        return preserving_lookup(lookup, pools, constants, map, depth + 1);
+    }
+    if t.len() != 4 || t[1] != "[" || t[3] != "]" {
+        return None;
+    }
+    decode_numeric_key(pools.get(t[0])?.get(number(t[2], constants)?)?, map)
 }
 pub(super) struct Extraction {
     pub key: Option<u32>,
@@ -78,6 +119,7 @@ pub(super) fn analyze(source: &str) -> Extraction {
         .collect();
     let all: Vec<_> = arrays.iter().flat_map(|(_, a)| a.iter()).collect();
     let mut maps = BTreeSet::new();
+    let mut unsupported_bound_lookup = false;
     for a in all.iter().filter(|s| s.len() == 17) {
         let Some(m32) = bind_numeric_anchor(&[255; 256], a, b"4294967295.000000") else {
             continue;
@@ -196,50 +238,14 @@ pub(super) fn analyze(source: &str) -> Extraction {
             if end == t.len() || t[i + 3..end].contains(&"function") {
                 continue;
             }
-            let mut values = BTreeSet::new();
-            let mut lookups = 0;
-            let mut index_depth = 0i32;
-            let mut numeric_index_lookup = false;
-            for w in t[i + 3..end].windows(4) {
-                // A digit-table value used as another array's index is not
-                // the value of this initializer. The fresh 919ca0 build has
-                // a second pair member containing buffer[pool[one]], which
-                // otherwise creates a false key candidate of 1.
-                let inside_index = index_depth > 0;
-                match w[0] {
-                    "[" => index_depth += 1,
-                    "]" => index_depth -= 1,
-                    _ => {}
-                }
-                if w[1] != "[" || w[3] != "]" {
-                    continue;
-                }
-                let Some(pool) = pools.get(w[0]) else {
-                    continue;
-                };
-                let Some(index) = number(w[2], &constants) else {
-                    continue;
-                };
-                let Some(encoded) = pool.get(index) else {
-                    continue;
-                };
-                if let Some(value) = decode_numeric_key(encoded, &map) {
-                    if inside_index {
-                        // Reject the whole initializer rather than merely
-                        // deleting an index operand from a larger expression.
-                        numeric_index_lookup = true;
-                        continue;
-                    }
-                    values.insert(value);
-                    lookups += 1;
-                }
-            }
-            if !numeric_index_lookup
-                && values.len() == 1
-                && (lookups == 1
-                    || (lookups == 2 && repeated_conditional(&t[i + 3..end], &unary_helpers)))
+            let expression = &t[i + 3..end];
+            if let Some(value) = preserving_lookup(expression, &pools, &constants, &map, 0) {
+                candidates.insert(value);
+            } else if expression
+                .windows(2)
+                .any(|w| pools.contains_key(w[0]) && w[1] == "[")
             {
-                candidates.insert(*values.first().unwrap());
+                unsupported_bound_lookup = true;
             }
         }
     }
@@ -247,6 +253,8 @@ pub(super) fn analyze(source: &str) -> Extraction {
         (candidates.first().copied(), "unique_bound_initializer")
     } else if !candidates.is_empty() {
         (None, "ambiguous_bound_initializers")
+    } else if unsupported_bound_lookup {
+        (None, "unsupported_bound_initializer")
     } else if registered_candidates.len() == 1 {
         (
             registered_candidates.first().copied(),
@@ -308,6 +316,29 @@ mod tests {
             );
             assert_eq!(analyze(&source).key, None);
         }
+    }
+    #[test]
+    fn rejects_transformed_lookup_initializers_from_copilot_review() {
+        let source = include_str!("fixtures/homedepot_491_split_numeric.js");
+        for expression in [
+            "parseInt(pool[index])+1",
+            "parseInt(pool[index])-1",
+            "transform(pool[index])",
+            "parseInt(transform(pool[index]))",
+            "flag ? transform(pool[index]) : transform(pool[index])",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(&source.replace("parseInt(pool[index])", expression)),
+                None,
+                "{expression}"
+            );
+        }
+        assert_eq!(
+            extract_shuffle_key(
+                &source.replace("parseInt(pool[index])", "(parseInt(pool[index],10))")
+            ),
+            Some(9_618_129)
+        );
     }
     #[test]
     fn repeated_same_key_branches_are_one_candidate() {

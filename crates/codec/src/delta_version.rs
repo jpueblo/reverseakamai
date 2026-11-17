@@ -321,8 +321,75 @@ pub(super) fn integer_constants(t: &[&str]) -> BTreeMap<String, i64> {
     constants(t, &minus)
 }
 
+struct DecoderFunction<'a> {
+    name: &'a str,
+    params: Vec<&'a str>,
+    begin: usize,
+    end: usize,
+}
+fn decoder_functions<'a>(t: &[&'a str]) -> Vec<DecoderFunction<'a>> {
+    let mut functions = Vec::new();
+    for i in 0..t.len() {
+        if t[i] != "function" {
+            continue;
+        }
+        let assigned = if i >= 2 && t[i - 1] == "=" && ident(t[i - 2]) {
+            Some(t[i - 2])
+        } else {
+            None
+        };
+        let (name, open) = if t.get(i + 1) == Some(&"(") {
+            let Some(name) = assigned else { continue };
+            (name, i + 1)
+        } else if t.get(i + 2) == Some(&"(") && t.get(i + 1).is_some_and(|v| ident(v)) {
+            (assigned.unwrap_or(t[i + 1]), i + 2)
+        } else {
+            continue;
+        };
+        let Some(close) = (open + 1..t.len()).find(|&j| t[j] == ")") else {
+            continue;
+        };
+        let parts = &t[open + 1..close];
+        if parts.is_empty()
+            || !parts
+                .iter()
+                .enumerate()
+                .all(|(j, v)| if j % 2 == 0 { ident(v) } else { *v == "," })
+        {
+            continue;
+        }
+        if t.get(close + 1) != Some(&"{") {
+            continue;
+        }
+        let mut level = 1i32;
+        let mut end = close + 2;
+        while end < t.len() {
+            match t[end] {
+                "{" => level += 1,
+                "}" => level -= 1,
+                _ => {}
+            }
+            if level == 0 {
+                break;
+            }
+            end += 1;
+        }
+        if end == t.len() {
+            continue;
+        }
+        functions.push(DecoderFunction {
+            name,
+            params: parts.iter().step_by(2).copied().collect(),
+            begin: close + 2,
+            end,
+        });
+    }
+    functions
+}
+
 pub(super) fn extract(source: &str) -> Option<String> {
     let t = tokens(source);
+    let functions = decoder_functions(&t);
     let mut minus = BTreeSet::new();
     let mut subtract = BTreeSet::new();
     for w in t.windows(12) {
@@ -400,28 +467,62 @@ pub(super) fn extract(source: &str) -> Option<String> {
     for (owner, a) in bound_tables {
         // Bind each table to its delta accumulator and seed stack. Arbitrary
         // arrays and unrelated push() calls cannot serve as decoders.
-        for fallback in t
-            .windows(4)
-            .filter(|w| w[1] == "=" && w[2] == owner && w[3] == ";")
-        {
-            for step in t.windows(7).filter(|w| {
-                w[1] == "+=" && w[2] == fallback[0] && w[3] == "[" && w[5..7] == ["]", ";"]
-            }) {
-                for seed in t.windows(19) {
-                    if seed[0] == step[0]
-                        && seed[1] == "="
-                        && subtract.contains(seed[2])
-                        && seed[3] == "("
-                        && seed[5] == ","
-                        && seed[7] == "["
-                        && seed[8] == seed[2]
-                        && seed[9] == "("
-                        && seed[10] == seed[6]
-                        && seed[11..14] == [".", "length", ","]
-                        && known.get(seed[14]) == Some(&1)
-                        && seed[15..19] == [")", "]", ")", ";"]
-                    {
-                        tables.push((a.clone(), seed[6]));
+        for function in &functions {
+            if functions.iter().filter(|f| f.name == function.name).count() != 1 {
+                continue;
+            }
+            let body = &t[function.begin..function.end];
+            for fallback in body
+                .windows(4)
+                .filter(|w| w[1] == "=" && w[2] == owner && w[3] == ";")
+            {
+                for step in body.windows(7).filter(|w| {
+                    w[1] == "+=" && w[2] == fallback[0] && w[3] == "[" && w[5..7] == ["]", ";"]
+                }) {
+                    for seed in body.windows(19) {
+                        if seed[0] != step[0]
+                            || seed[1] != "="
+                            || !subtract.contains(seed[2])
+                            || seed[3] != "("
+                            || seed[5] != ","
+                            || seed[7] != "["
+                            || seed[8] != seed[2]
+                            || seed[9] != "("
+                            || seed[10] != seed[6]
+                            || seed[11..14] != [".", "length", ","]
+                            || known.get(seed[14]) != Some(&1)
+                            || seed[15..19] != [")", "]", ")", ";"]
+                        {
+                            continue;
+                        }
+                        let Some(initial_arg) = function.params.iter().position(|p| *p == seed[4])
+                        else {
+                            continue;
+                        };
+                        let Some(index_arg) = function.params.iter().position(|p| *p == step[4])
+                        else {
+                            continue;
+                        };
+                        for length in body
+                            .windows(7)
+                            .filter(|w| w[..2] == ["while", "("] && w[3..] == ["--", ">", "0", ")"])
+                        {
+                            let Some(length_arg) =
+                                function.params.iter().position(|p| *p == length[2])
+                            else {
+                                continue;
+                            };
+                            tables.push((
+                                a.clone(),
+                                seed[6],
+                                function.name,
+                                function.end,
+                                initial_arg,
+                                index_arg,
+                                length_arg,
+                                function.params.len(),
+                            ));
+                        }
                     }
                 }
             }
@@ -457,29 +558,50 @@ pub(super) fn extract(source: &str) -> Option<String> {
         let Some((args, end)) = array(&t, i + 5, &known, &minus, 0) else {
             continue;
         };
-        if t.get(end) != Some(&")") { continue; }
-        // The captured 217bb3 wrapper takes (length, initial, index, unused).
-        // Six-argument wrappers retain their original final-index layout.
-        let (start, initials): (i64, Vec<i64>) = match args.as_slice() {
-            [Some(44), Some(initial), Some(index), _] => (*index, vec![*initial]),
-            [_, _, _, _, _, Some(index)] if args.contains(&Some(44)) => (
-                *index, args[..5].iter().flatten().copied().filter(|v| *v != 44).collect()
-            ),
-            _ => continue,
-        };
+        if t.get(end) != Some(&")") {
+            continue;
+        }
         let Some((stack, Some(seed))) = scope.iter().rev().find_map(|n| *n) else {
             continue;
         };
-        for initial in initials {
+        for (
+            table,
+            decoder_stack,
+            callee,
+            definition_end,
+            initial_arg,
+            index_arg,
+            length_arg,
+            arity,
+        ) in &tables
+        {
+            if i == 0
+                || t[i - 1] != *callee
+                || (i >= 2 && t[i - 2] == ".")
+                || i <= *definition_end
+                || *decoder_stack != stack
+                || args.len() != *arity
+            {
+                continue;
+            }
+            // Reassignment would invalidate the retained function identity.
+            if t[*definition_end..i]
+                .windows(2)
+                .any(|w| w[0] == *callee && w[1] == "=")
+            {
+                continue;
+            }
+            if args[*length_arg] != Some(44) {
+                continue;
+            }
+            let (Some(initial), Some(start)) = (args[*initial_arg], args[*index_arg]) else {
+                continue;
+            };
             let Some(initial) = initial.checked_sub(seed) else {
                 continue;
             };
-            for (table, decoder_stack) in &tables {
-                if *decoder_stack == stack {
-                    if let Some(token) = decode(table, start, initial) {
-                        candidates.insert(token);
-                    }
-                }
+            if let Some(token) = decode(table, start, initial) {
+                candidates.insert(token);
             }
         }
     }
@@ -553,27 +675,60 @@ mod tests {
         assert_eq!(extract(&nested), None);
         assert_eq!(extract(&format!("a={}1;", "!".repeat(100))), None);
         assert_eq!(extract(&format!("a={}1;", "1+".repeat(1000))), None);
-        assert_eq!(extract("const æ—¥æœ¬èªž = 1;"), None);
+        assert_eq!(extract("const Ã¦â€”Â¥Ã¦Å“Â¬Ã¨ÂªÅ¾ = 1;"), None);
     }
     #[test]
     fn captured_four_argument_version_lookup() {
-        let source=include_str!("fixtures/homedepot_217bb3_four_args.js");
-        assert_eq!(extract(source).as_deref(),Some("gyC8AZNPtjoZhpueCDw8o59DmLPOz/qFpTY1O/mhanE="));
-        let renamed=source.replace("stack","seeds").replace("table","deltas");
-        assert_eq!(extract(&renamed),extract(source));
+        let source = include_str!("fixtures/homedepot_217bb3_four_args.js");
+        assert_eq!(
+            extract(source).as_deref(),
+            Some("gyC8AZNPtjoZhpueCDw8o59DmLPOz/qFpTY1O/mhanE=")
+        );
+        let renamed = source.replace("stack", "seeds").replace("table", "deltas");
+        assert_eq!(extract(&renamed), extract(source));
+    }
+    #[test]
+    fn binds_apply_callee_and_argument_positions_from_copilot_review() {
+        assert!(extract(FIXTURE).is_some());
+        let unrelated = FIXTURE.replace("decoder.apply", "unrelated.apply")
+            + "function unrelated(){return 'not a version';}";
+        assert_eq!(extract(&unrelated), None);
+        assert_eq!(
+            extract(&FIXTURE.replace("decoder.apply", "object.decoder.apply")),
+            None
+        );
+        assert_eq!(
+            extract(&FIXTURE.replace(
+                "var version=decoder.apply",
+                "decoder=unrelated;var version=decoder.apply"
+            )),
+            None
+        );
+        assert_eq!(
+            extract(&FIXTURE.replace("[size,0,0,initial,0,start]", "[initial,0,0,size,0,start]")),
+            None
+        );
+        assert_eq!(
+            extract(&FIXTURE.replace("[size,0,0,initial,0,start]", "[size,initial,0,0,0,start]")),
+            None
+        );
+        let renamed = FIXTURE.replace("decoder", "renamed_decoder");
+        assert_eq!(extract(&renamed), extract(FIXTURE));
     }
     #[test]
     fn rejects_invalid_four_argument_layout_or_seed() {
-        let source=include_str!("fixtures/homedepot_217bb3_four_args.js");
-        for broken in [source.replace("seed=596","seed=597"),
-            source.replace("initial=699","initial=700"),
-            source.replace("count=44","count=43"),
-            source.replace("start=0","start=1"),
-            source.replace("[count,initial,start,0]","[count,initial,0,start,0]"),
-            source.replace("stack.push(seed);","stack.pop();"),
-            source.replace("[count,initial,start,0]","[count,dynamic(),start,0]"),
+        let source = include_str!("fixtures/homedepot_217bb3_four_args.js");
+        for broken in [
+            source.replace("seed=596", "seed=597"),
+            source.replace("initial=699", "initial=700"),
+            source.replace("count=44", "count=43"),
+            source.replace("start=0", "start=1"),
+            source.replace("[count,initial,start,0]", "[count,initial,0,start,0]"),
+            source.replace("stack.push(seed);", "stack.pop();"),
+            source.replace("[count,initial,start,0]", "[count,dynamic(),start,0]"),
             format!("/* {source} */"),
-        ] { assert_eq!(extract(&broken),None); }
+        ] {
+            assert_eq!(extract(&broken), None);
+        }
     }
-
 }

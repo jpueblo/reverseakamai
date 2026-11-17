@@ -67,7 +67,7 @@ seeds, unknown references, truncated arrays, decoy literals/comments/regexes,
 conflicting keys, nested indexes, negation, and recursion limits. The original
 shuffle-key snippet remains covered.
 
-All 46 codec unit tests passed, including the new parser regressions.
+All 48 codec unit tests passed, including the review regressions below.
 
 Validation command: `cargo test --offline -p akamai-codec --lib`, using the
 existing Windows instrumented harness. The parser source and fixtures are
@@ -86,3 +86,19 @@ documented in `WINDOWS_PROFILE_FIX.md`.
 
 The SBSD guard, sensor submission policy, SDK request workflow, and interpreter
 implementation are unchanged by these parser fixes. Live tests remain paused.
+
+## Copilot review follow-up
+
+Both reported false positives were reproduced before correction. A shuffle
+initializer is now accepted only when its complete expression has a supported
+value-preserving shape: a pool lookup, a parseInt lookup (optionally radix 10),
+parentheses, or a simple conditional whose supported branches produce the same
+key. Arithmetic and unknown transforming calls are rejected; an unsupported
+bound lookup cannot silently fall through to an unrelated sentinel.
+
+Delta decoding now retains the decoder function identity, body bounds, seed
+stack, and parameter positions for length, initial accumulator, and table index.
+Only apply calls to that recognized function with the correct argument mapping
+are decoded. Unrelated/member callees, reassigned decoders, conflicting function
+names, and changed argument positions fail closed. This remains a constrained
+recognizer and may reject new layouts until they have dedicated evidence/tests.
