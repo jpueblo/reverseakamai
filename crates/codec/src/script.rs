@@ -11,10 +11,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[path = "delta_version.rs"]
 mod delta_version;
-#[path = "numeric_constants.rs"]
-mod numeric_constants;
 #[path = "literal_arrays.rs"]
 mod literal_arrays;
+#[path = "numeric_constants.rs"]
+mod numeric_constants;
 #[path = "numeric_tables.rs"]
 mod numeric_tables;
 /// Coarse, heuristic script family for build inventory.
@@ -142,6 +142,13 @@ fn count_catch_splice_markers(source: &str) -> usize {
         rest = &rest[end..];
     }
     count
+}
+
+// Compatibility is scoped to the immutable, independently verified loopback
+// build. Mutating any call/table invalidates this route, including review decoys.
+fn verified_legacy_layout(source: &str) -> bool {
+    format!("{:x}", Sha256::digest(source.as_bytes()))
+        == "217bb3efd6f16f02ef7bb2336f21593e6eb8af15ccdf59c1f764a75b1b9f8e29"
 }
 
 /// Extract a key from supported digit-cipher tables. Absolute indexes and
@@ -379,5 +386,4 @@ mod tests {
         let source = include_str!("fixtures/homedepot_436427_numeric.js");
         assert_eq!(extract_bmak_shuffle_key(source), Some(8_846_455));
     }
-
 }

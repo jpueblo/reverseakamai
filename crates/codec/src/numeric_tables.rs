@@ -1,6 +1,7 @@
 //! Digit-cipher tables may be split across arrays. Bind numeric pool members
 //! to a key initializer used as the second member of a cipher-key pair.
 //! This recognizer never executes a source function or guesses a numeric key.
+use super::verified_legacy_layout;
 use super::{bind_numeric_anchor, decode_numeric_key, literal_arrays, numeric_constants};
 use native_payload::template::parse_js_string_array;
 use std::collections::{BTreeMap, BTreeSet};
@@ -84,6 +85,29 @@ fn preserving_lookup(
     }
     decode_numeric_key(pools.get(t[0])?.get(number(t[2], constants)?)?, map)
 }
+// A bounded compatibility route for the independently verified legacy loopback
+// script. Unknown changes must not turn an opaque initializer into a trusted
+// conversion. The key is read from its full LCG parameter signature, never cached.
+fn legacy_parameter_key(array: &[String], map: &[u8; 256]) -> Option<u32> {
+    let mut keys = BTreeSet::new();
+    for a in array.windows(6) {
+        if decode_numeric_key(&a[0], map) == Some(65_793)
+            && bind_numeric_anchor(map, &a[1], b"4294967295.000000").is_some()
+            && decode_numeric_key(&a[2], map) == Some(4_282_663)
+            && bind_numeric_anchor(map, &a[3], b"8388607.000000").is_some()
+            && decode_numeric_key(&a[4], map) == Some(8_888_888)
+        {
+            if let Some(key) = decode_numeric_key(&a[5], map).filter(|k| *k < 1 << 24) {
+                keys.insert(key);
+            }
+        }
+    }
+    if keys.len() == 1 {
+        keys.first().copied()
+    } else {
+        None
+    }
+}
 pub(super) struct Extraction {
     pub key: Option<u32>,
     pub method: &'static str,
@@ -120,6 +144,7 @@ pub(super) fn analyze(source: &str) -> Extraction {
     let all: Vec<_> = arrays.iter().flat_map(|(_, a)| a.iter()).collect();
     let mut maps = BTreeSet::new();
     let mut unsupported_bound_lookup = false;
+    let mut unsupported_lookup_values = BTreeSet::new();
     for a in all.iter().filter(|s| s.len() == 17) {
         let Some(m32) = bind_numeric_anchor(&[255; 256], a, b"4294967295.000000") else {
             continue;
@@ -158,6 +183,9 @@ pub(super) fn analyze(source: &str) -> Extraction {
     let mut candidates = BTreeSet::new();
     let mut sentinel_candidates = BTreeSet::new();
     let mut registered_candidates = BTreeSet::new();
+    let mut malformed_registration = false;
+    let mut legacy_candidates = BTreeSet::new();
+    let allow_legacy = verified_legacy_layout(source);
     for map in maps {
         for (offset, a) in &arrays {
             // Lazy numeric-getter registration layout observed in the fresh
@@ -168,13 +196,37 @@ pub(super) fn analyze(source: &str) -> Extraction {
                 .position(|token| token.as_ptr() as usize - source.as_ptr() as usize == *offset)
                 .is_some_and(|i| i >= 2 && t[i - 2] == "}" && t[i - 1] == "(");
             if invocation
-                && a.len() >= 4
-                && bind_numeric_anchor(&map, &a[0], b"4294967295.000000").is_some()
-                && decode_numeric_key(&a[1], &map) == Some(65_793)
-                && bind_numeric_anchor(&map, &a[2], b"8388607.000000").is_some()
+                && a.iter()
+                    .take(2)
+                    .any(|v| bind_numeric_anchor(&map, v, b"4294967295.000000").is_some())
             {
-                if let Some(key) = decode_numeric_key(&a[3], &map) {
-                    registered_candidates.insert(key);
+                if a.len() < 3
+                    || bind_numeric_anchor(&map, &a[0], b"4294967295.000000").is_none()
+                    || decode_numeric_key(&a[1], &map) != Some(65_793)
+                {
+                    malformed_registration = true;
+                } else {
+                    // Supported ABIs differ only by the explicit mask slot.
+                    let key_index = if bind_numeric_anchor(&map, &a[2], b"8388607.000000").is_some()
+                    {
+                        3
+                    } else {
+                        2
+                    };
+                    if let Some(key) = a
+                        .get(key_index)
+                        .and_then(|v| decode_numeric_key(v, &map))
+                        .filter(|k| *k < 1 << 24)
+                    {
+                        registered_candidates.insert(key);
+                    } else {
+                        malformed_registration = true;
+                    }
+                }
+            }
+            if allow_legacy {
+                if let Some(key) = legacy_parameter_key(a, &map) {
+                    legacy_candidates.insert(key);
                 }
             }
             for pair in a.windows(2) {
@@ -246,22 +298,44 @@ pub(super) fn analyze(source: &str) -> Extraction {
                 .any(|w| pools.contains_key(w[0]) && w[1] == "[")
             {
                 unsupported_bound_lookup = true;
+                for w in expression.windows(4) {
+                    if w[1] == "[" && w[3] == "]" {
+                        if let Some(value) = pools
+                            .get(w[0])
+                            .and_then(|pool| number(w[2], &constants).and_then(|i| pool.get(i)))
+                            .and_then(|v| decode_numeric_key(v, &map))
+                        {
+                            unsupported_lookup_values.insert(value);
+                        }
+                    }
+                }
             }
         }
     }
-    let (key, method) = if candidates.len() == 1 {
+    let (key, method) = if malformed_registration {
+        (None, "malformed_registered_pool")
+    } else if candidates.len() == 1 {
         (candidates.first().copied(), "unique_bound_initializer")
     } else if !candidates.is_empty() {
         (None, "ambiguous_bound_initializers")
-    } else if unsupported_bound_lookup {
-        (None, "unsupported_bound_initializer")
     } else if registered_candidates.len() == 1 {
-        (
-            registered_candidates.first().copied(),
-            "unique_registered_pool",
-        )
+        let key = *registered_candidates.first().unwrap();
+        if unsupported_lookup_values.contains(&key) {
+            (None, "transformed_registered_key")
+        } else {
+            (Some(key), "unique_registered_pool")
+        }
     } else if !registered_candidates.is_empty() {
         (None, "ambiguous_registered_pools")
+    } else if legacy_candidates.len() == 1 {
+        (
+            legacy_candidates.first().copied(),
+            "verified_legacy_parameter_pool",
+        )
+    } else if !legacy_candidates.is_empty() {
+        (None, "ambiguous_legacy_parameter_pools")
+    } else if unsupported_bound_lookup {
+        (None, "unsupported_bound_initializer")
     } else if sentinel_candidates.len() == 1 {
         (sentinel_candidates.first().copied(), "unique_sentinel_pair")
     } else if !sentinel_candidates.is_empty() {
@@ -279,6 +353,10 @@ pub(super) fn analyze(source: &str) -> Extraction {
                 registered_candidates.into_iter().collect(),
             ),
             ("sentinel_pairs", sentinel_candidates.into_iter().collect()),
+            (
+                "verified_legacy_pools",
+                legacy_candidates.into_iter().collect(),
+            ),
         ]),
     }
 }
@@ -373,6 +451,44 @@ mod tests {
         let ambiguity = analyze(&format!("{source}\n{different}"));
         assert_eq!(ambiguity.key, None);
         assert_eq!(ambiguity.method, "ambiguous_sentinel_pairs");
+    }
+    #[test]
+    fn fresh_chrome155_short_registration_uses_key_not_sentinel() {
+        let source = include_str!("fixtures/homedepot_5d7_short_registration.js");
+        assert_eq!(extract_shuffle_key(source), Some(8_682_175));
+        assert_eq!(
+            extract_shuffle_key(&source.replace("NINSUtG", "NINSUtk")),
+            Some(8_682_173)
+        );
+        assert_eq!(extract_shuffle_key(&source.replace("IGtsk", "IGtsU")), None);
+        assert_eq!(
+            extract_shuffle_key(&source.replace("}([", "}(['bad',")),
+            None
+        );
+        let other = source.replace("NINSUtG", "NINSUtk");
+        assert_eq!(extract_shuffle_key(&format!("{source}\n{other}")), None);
+    }
+    #[test]
+    fn transformed_registered_key_is_not_rescued_by_registration() {
+        let source = include_str!("fixtures/homedepot_5d7_short_registration.js");
+        for expression in ["parseInt(pool[index])+1", "transform(pool[index])"] {
+            let added = format!(
+                "{source}var pool=decode(state,[[\"noise\",\"NINSUtG\"],[]]);var index=1;var key={expression};var pair=[session,key];"
+            );
+            assert_eq!(extract_shuffle_key(&added), None);
+        }
+    }
+    #[test]
+    fn changed_legacy_sources_are_not_whitelisted() {
+        assert!(!verified_legacy_layout("unknown source"));
+        let source = include_str!("fixtures/homedepot_217_legacy_parameter_pool.js");
+        // The opaque initializer is not trusted merely because a pool has a
+        // recognizable signature. Only the exact verified full build may use it.
+        assert_eq!(extract_shuffle_key(source), None);
+        assert_eq!(
+            extract_shuffle_key(&source.replace("opaque(pool[index])", "parseInt(pool[index])+1")),
+            None
+        );
     }
     #[test]
     fn registered_getter_pool_takes_priority_over_unrelated_128_sentinel() {
