@@ -567,7 +567,7 @@ mod tests {
         // 'b' XOR '#' gives the 20-byte 'A' key; 'q' XOR 'A' is '0'.
         let ver = format!("{}=", "0".repeat(43));
         let table = format!(
-            "return [\"{}|\",\"{}\",\"{}\",\"{}\"];",
+            "function version_table(){{return [\"{}|\",\"{}\",\"{}\",\"{}\"];}}",
             "q".repeat(43),
             "b".repeat(20),
             "#".repeat(21),

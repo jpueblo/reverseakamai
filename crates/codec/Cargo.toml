@@ -16,3 +16,11 @@ native-payload.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
+
+oxc_allocator = "=0.156.0"
+oxc_ast = "=0.156.0"
+oxc_parser = "=0.156.0"
+oxc_semantic = "=0.156.0"
+oxc_span = "=0.156.0"
+oxc_syntax = "=0.156.0"
+rustc-hash = "=2.1.3"

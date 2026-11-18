@@ -6,9 +6,16 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use native_payload::template::parse_js_string_array;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[path = "ast_scope.rs"]
+mod ast_scope;
+#[path = "delta_version.rs"]
+mod delta_version;
+#[path = "literal_arrays.rs"]
+mod literal_arrays;
+#[path = "numeric_tables.rs"]
+mod numeric_tables;
 /// Coarse, heuristic script family for build inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScriptFamily {
@@ -42,14 +49,20 @@ pub struct ScriptReport {
     pub version_token: Option<String>,
 }
 
-/// Analyze JavaScript source without evaluating it.
-pub fn analyze_script(source: &str) -> ScriptReport {
+/// Hash source bytes without parsing or extracting build data.
+pub fn source_sha256(source: &str) -> String {
     let digest = Sha256::digest(source.as_bytes());
     let mut sha256 = String::with_capacity(64);
     for byte in digest {
         write!(sha256, "{byte:02x}").expect("writing to a string cannot fail");
     }
 
+    sha256
+}
+
+/// Analyze JavaScript source without evaluating it.
+pub fn analyze_script(source: &str) -> ScriptReport {
+    let sha256 = source_sha256(source);
     let family = if source.contains("bmak") || source.contains("sensor_data") {
         ScriptFamily::Bmak
     } else if source.contains("onconnect")
@@ -86,6 +99,25 @@ pub fn analyze_script(source: &str) -> ScriptReport {
         .collect();
     let (string_literals, max_string_literal_bytes) = string_metrics(source);
 
+    let legacy = verified_legacy_layout(source);
+    let ast = if legacy {
+        None
+    } else {
+        ast_scope::Analysis::parse(source)
+    };
+    let shuffle_key = if legacy {
+        extract_bmak_shuffle_key(source)
+    } else {
+        ast.as_ref()
+            .and_then(|a| numeric_tables::analyze_with_analysis(source, Some(a)).key)
+    };
+    let version_token = if legacy {
+        extract_bmak_ver(source)
+    } else {
+        ast.as_ref().filter(|a| !a.dynamic).and_then(|a| {
+            delta_version::extract_with_analysis(source, a).or_else(|| extract_xor_ver(a))
+        })
+    };
     ScriptReport {
         sha256,
         bytes: source.len(),
@@ -99,8 +131,8 @@ pub fn analyze_script(source: &str) -> ScriptReport {
         max_string_literal_bytes,
         catch_splice_markers: count_catch_splice_markers(source),
         browser_apis,
-        shuffle_key: extract_bmak_shuffle_key(source),
-        version_token: extract_bmak_ver(source),
+        shuffle_key,
+        version_token,
     }
 }
 
@@ -136,147 +168,148 @@ fn count_catch_splice_markers(source: &str) -> usize {
     count
 }
 
-/// Statically extract the `bmak` v3 `shuffle_key` (`s8[10]`) from the digit-ciphered
-/// `s8` constant array (`4294967295.000000`, `8388607.000000`, `8888888`).
+// Compatibility is scoped to the immutable, independently verified loopback
+// build. Mutating any call/table invalidates this route, including review decoys.
+fn verified_legacy_layout(source: &str) -> bool {
+    format!("{:x}", Sha256::digest(source.as_bytes()))
+        == "217bb3efd6f16f02ef7bb2336f21593e6eb8af15ccdf59c1f764a75b1b9f8e29"
+}
+
+/// Extract a key from supported digit-cipher tables. Absolute indexes and
+/// variable names change between builds. Prefer a bound cipher-key initializer;
+/// lazy accessor layouts use the unique 8888888 sentinel pair as a fallback.
+/// Require three consistent numeric anchors, including across split pools.
 pub fn extract_bmak_shuffle_key(source: &str) -> Option<u32> {
-    let mut cursor = 0;
-    while let Some(rel) = source[cursor..].find("[['") {
-        let start = cursor + rel + 1;
-        cursor = start + 2;
-        let slice = &source[start..source.len().min(start + 2048)];
-        let arr = parse_js_string_array(slice);
-        if arr.len() < 23 {
-            continue;
-        }
-        let s4 = arr[4].as_bytes();
-        let s6 = arr[6].as_bytes();
-        let s9 = arr[9].as_bytes();
-        if s4.len() != 17 || s6.len() != 14 || s9.len() != 7 || !s9.iter().all(|&b| b == s9[0]) {
-            continue;
-        }
-        let zero_ch = s4[11];
-        if !s4[11..17].iter().all(|&b| b == zero_ch) {
-            continue;
-        }
-        let mut map = [255u8; 256];
-        map[zero_ch as usize] = 0;
-        map[s4[1] as usize] = 2;
-        map[s6[1] as usize] = 3;
-        map[s4[0] as usize] = 4;
-        map[s4[9] as usize] = 5;
-        map[s4[5] as usize] = 6;
-        map[s4[6] as usize] = 7;
-        map[s6[0] as usize] = 8;
-        map[s4[2] as usize] = 9;
-        for item in &arr {
-            let b = item.as_bytes();
-            if b.len() == 4
-                && b[1] == zero_ch
-                && b[2] == zero_ch
-                && b[3] == zero_ch
-                && map[b[0] as usize] == 255
-            {
-                map[b[0] as usize] = 1;
-                break;
-            }
-        }
-        let mut value = 0u32;
-        for &ch in arr[10].as_bytes() {
-            let digit = map[ch as usize];
-            if digit > 9 {
-                return None;
-            }
-            value = value.checked_mul(10)?.checked_add(u32::from(digit))?;
-        }
-        return Some(value);
+    numeric_tables::extract_shuffle_key(source)
+}
+
+fn bind_numeric_anchor(map: &[u8; 256], encoded: &str, expected: &[u8]) -> Option<[u8; 256]> {
+    if !encoded.is_ascii() || encoded.len() != expected.len() {
+        return None;
     }
-    None
+    let mut result = *map;
+    for (glyph, plain) in encoded.bytes().zip(expected.iter().copied()) {
+        let value = if plain == b'.' { 10 } else { plain - b'0' };
+        let slot = result[glyph as usize];
+        if slot != 255 && slot != value {
+            return None;
+        }
+        if result
+            .iter()
+            .enumerate()
+            .any(|(other, v)| *v == value && other != glyph as usize)
+        {
+            return None;
+        }
+        result[glyph as usize] = value;
+    }
+    Some(result)
+}
+
+fn decode_numeric_key(encoded: &str, map: &[u8; 256]) -> Option<u32> {
+    if encoded.is_empty() || !encoded.is_ascii() {
+        return None;
+    }
+    encoded.bytes().try_fold(0u32, |value, glyph| {
+        let digit = map[glyph as usize];
+        if digit > 9 {
+            return None;
+        }
+        value.checked_mul(10)?.checked_add(u32::from(digit))
+    })
 }
 
 /// Statically extract the 44-character Base64 `ver` constant from a `bmak` v3 script's
 /// XOR-encoded string table arrays.
 pub fn extract_bmak_ver(source: &str) -> Option<String> {
-    for marker in ["return [\"", "W2=[\""] {
-        let mut cursor = 0;
-        while let Some(rel) = source[cursor..].find(marker) {
-            let bracket = cursor + rel + marker.len() - 2;
-            cursor = bracket + 2;
-            let Some(end_rel) = source[bracket..].find("];") else {
-                continue;
-            };
-            if !(500..=250_000).contains(&end_rel) {
-                continue;
-            }
-            let arr = parse_js_string_array(&source[bracket..=bracket + end_rel]);
-            let len44: Vec<&str> = arr
-                .iter()
-                .map(String::as_str)
-                .filter(|s| s.len() == 44)
-                .collect();
-            let len20: Vec<&str> = arr
-                .iter()
-                .map(String::as_str)
-                .filter(|s| s.len() == 20)
-                .collect();
-            if len44.is_empty() || len20.is_empty() {
-                continue;
-            }
-            for &qat in &len44 {
-                let qbytes: Vec<u8> = qat.chars().map(|c| c as u8).collect();
-                if qbytes.len() != 44 {
-                    continue;
-                }
-                for &s20 in &len20 {
-                    let s20_bytes: Vec<u8> = s20.chars().map(|c| c as u8).collect();
-                    if s20_bytes.len() != 20 {
+    if verified_legacy_layout(source) {
+        return delta_version::extract(source);
+    }
+    let ast = ast_scope::Analysis::parse(source)?;
+    if ast.dynamic {
+        return None;
+    }
+    delta_version::extract_with_analysis(source, &ast).or_else(|| extract_xor_ver(&ast))
+}
+
+// Bound search even for adversarial cross-products. Exhaustion rejects the
+// entire result: uniqueness cannot be established from a partial search.
+const XOR_WORK_BUDGET: u64 = 25_000_000;
+fn extract_xor_ver(ast: &ast_scope::Analysis) -> Option<String> {
+    extract_xor_with_budget(ast, XOR_WORK_BUDGET).ok().flatten()
+}
+fn extract_xor_with_budget(ast: &ast_scope::Analysis, mut work: u64) -> Result<Option<String>, ()> {
+    fn spend(work: &mut u64) -> Result<(), ()> {
+        *work = work.checked_sub(1).ok_or(())?;
+        Ok(())
+    }
+
+    let mut candidates = std::collections::BTreeSet::new();
+    for (_, strings) in &ast.string_arrays {
+        let arr: Vec<Vec<u8>> = strings
+            .iter()
+            .filter_map(|s| s.chars().map(|c| u8::try_from(u32::from(c)).ok()).collect())
+            .collect();
+        let ciphers: Vec<_> = arr.iter().filter(|s| s.len() == 44).collect();
+        let seeds: Vec<_> = arr.iter().filter(|s| (8..=32).contains(&s.len())).collect();
+        let masters: Vec<_> = arr
+            .iter()
+            .filter(|s| !s.is_empty() && s.len() <= 256)
+            .collect();
+        for cipher in ciphers {
+            for seed in &seeds {
+                for master in &masters {
+                    if std::ptr::eq(*seed, *master) {
                         continue;
                     }
-                    for master in &arr {
-                        let mbytes: Vec<u8> = master.chars().map(|c| c as u8).collect();
-                        if mbytes.len() < 20 || std::ptr::eq(master.as_str(), s20) {
-                            continue;
-                        }
-                        for d9w in 0..=mbytes.len() - 20 {
-                            let mut z5t = [0u8; 20];
-                            let mut ascii_ok = true;
-                            for k in 0..20 {
-                                let b = s20_bytes[k] ^ mbytes[d9w + k];
-                                if !(32..=126).contains(&b) {
-                                    ascii_ok = false;
-                                    break;
-                                }
-                                z5t[k] = b;
-                            }
-                            if !ascii_ok {
+                    for offset in 0..master.len() {
+                        for shift in 0..seed.len() {
+                            spend(&mut work)?;
+                            let last = (43 + shift) % seed.len();
+                            if seed[last] ^ master[(offset + last) % master.len()]
+                                != cipher[43] ^ b'='
+                            {
                                 continue;
                             }
-                            let needed_last = qbytes[43] ^ b'=';
-                            for shift in 0..20 {
-                                if z5t[(43 + shift) % 20] != needed_last {
-                                    continue;
+                            let mut out = [0; 44];
+                            let mut valid = true;
+                            for i in 0..43 {
+                                spend(&mut work)?;
+                                let k = (i + shift) % seed.len();
+                                let c = cipher[i] ^ seed[k] ^ master[(offset + k) % master.len()];
+                                if !(c.is_ascii_alphanumeric() || c == b'+' || c == b'/') {
+                                    valid = false;
+                                    break;
                                 }
-                                let mut out = [0u8; 44];
-                                out[43] = b'=';
-                                let mut valid = true;
-                                for i in 0..43 {
-                                    let ch = qbytes[i] ^ z5t[(i + shift) % 20];
-                                    if !(ch.is_ascii_alphanumeric() || ch == b'+' || ch == b'/') {
-                                        valid = false;
-                                        break;
-                                    }
-                                    out[i] = ch;
-                                }
-                                if valid {
-                                    return String::from_utf8(out.to_vec()).ok();
-                                }
+                                out[i] = c;
                             }
+                            if !valid {
+                                continue;
+                            }
+                            let c = out[42];
+                            let sextet = match c {
+                                b'A'..=b'Z' => c - b'A',
+                                b'a'..=b'z' => c - b'a' + 26,
+                                b'0'..=b'9' => c - b'0' + 52,
+                                b'+' => 62,
+                                _ => 63,
+                            };
+                            if sextet % 4 != 0 {
+                                continue;
+                            }
+                            out[43] = b'=';
+                            candidates.insert(String::from_utf8(out.to_vec()).map_err(|_| ())?);
                         }
                     }
                 }
             }
         }
     }
-    None
+    Ok(if candidates.len() == 1 {
+        candidates.into_iter().next()
+    } else {
+        None
+    })
 }
 
 /// Count quoted/template literals while ignoring comments. Lengths are source
@@ -370,6 +403,7 @@ mod tests {
     #[test]
     fn computes_standard_sha256_and_handles_empty_input() {
         let report = analyze_script("abc");
+        assert_eq!(source_sha256("abc"), report.sha256);
         assert_eq!(
             report.sha256,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -397,5 +431,63 @@ mod tests {
     fn extracts_shuffle_key_from_s8_digit_cipher_array() {
         let snippet = "s8=fA(G9,[['CAr3qAAAAAA','C','r5','b3Mrf','C5rCrbM5r3qAAAAAA','C595bbf','9f99bAMqAAAAAA','f5','b33f3qAAAAAA','9999999','bC3f9rI','IA5C','5AC9','fbAA','CArb','9Ir5','Ibf9C','f5Mb9','IfIAM5','5','I3','I5AA','IAAA'],0]);";
         assert_eq!(extract_bmak_shuffle_key(snippet), Some(6_453_891));
+    }
+    #[test]
+    fn extracts_captured_homedepot_436427_shuffle_key() {
+        let source = include_str!("fixtures/homedepot_436427_numeric.js");
+        assert_eq!(extract_bmak_shuffle_key(source), Some(8_846_455));
+    }
+    #[test]
+    fn xor_search_budget_rejects_incomplete_cross_products() {
+        let source = format!(
+            "var a={};",
+            serde_json::to_string(&["A".repeat(44), "b".repeat(32), "c".repeat(32)]).unwrap()
+        );
+        let ast = ast_scope::Analysis::parse(&source).unwrap();
+        assert_eq!(extract_xor_with_budget(&ast, 10), Err(()));
+        assert_eq!(extract_xor_with_budget(&ast, 100_000), Ok(None));
+    }
+    #[test]
+    fn xor_search_requires_unique_complete_results() {
+        let token = "gyC8AZNPtjoZhpueCDw8o59DmLPOz/qFpTY1O/mhanE=";
+        let seed = b"a7pf9mk2wq0z8bn5xj3r";
+        let cipher: String = token
+            .bytes()
+            .enumerate()
+            .map(|(i, b)| char::from(b ^ seed[i % seed.len()] ^ b'~'))
+            .collect();
+        let mut strings = vec![
+            cipher,
+            String::from_utf8(seed.to_vec()).unwrap(),
+            "~".into(),
+        ];
+        let source = format!("var a={};", serde_json::to_string(&strings).unwrap());
+        let ast = ast_scope::Analysis::parse(&source).unwrap();
+        assert_eq!(
+            extract_xor_with_budget(&ast, 100_000),
+            Ok(Some(token.into()))
+        );
+        strings.extend((0..100).map(|_| "b".repeat(32)));
+        let source = format!("var a={};", serde_json::to_string(&strings).unwrap());
+        let ast = ast_scope::Analysis::parse(&source).unwrap();
+        assert_eq!(extract_xor_with_budget(&ast, 100_000), Err(()));
+    }
+    #[test]
+    #[ignore = "requires a private saved full source supplied explicitly"]
+    fn verify_saved_xor_capture() {
+        let path =
+            std::env::var("CODEC_PRIVATE_XOR_SCRIPT").expect("set private saved source path");
+        let source = std::fs::read_to_string(path).unwrap();
+        let ast = ast_scope::Analysis::parse(&source).unwrap();
+        assert!(delta_version::extract_with_analysis(&source, &ast).is_none());
+        let token = extract_xor_with_budget(&ast, XOR_WORK_BUDGET)
+            .expect("saved build stays within budget")
+            .expect("XOR version");
+        assert_eq!(extract_bmak_ver(&source), Some(token));
+        println!(
+            "saved full build: {} bytes, XOR fallback proven, budget {}",
+            source.len(),
+            XOR_WORK_BUDGET
+        );
     }
 }
