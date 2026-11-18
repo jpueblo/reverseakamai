@@ -1,96 +1,159 @@
-# Cross-platform build validation — 2026-11-18
+# Cross-platform build validation — 2026-11-19
 
-Branch: `AD-11054/cross-platform-build`.
-Base: `3f962f7521d685188009645c7a30240b593edca5` (`AD-11054/sdk-validation`).
-Validation used the working tree of the fork directly, not the generated harness.
+Branch: `main`.
+Validated source commit: `ddcfb507380dab92c3ad1fb153937b26d09e0fa8` (merged PRs #1, #2 and #3).
+This documentation-only update records validation of the source commit above.
 
-| Target | Build | Execution |
+Windows builds used the maintained fork directly, not a generated harness.
+Ubuntu used an exact Git export of the same merged commit. The ARM64 build below
+is a fresh cross-build of this merged source; it supersedes the older ARM64
+result from the pre-merge build branch.
+
+## Current target matrix
+
+| Target | Release build | Execution and qualification |
 | --- | --- | --- |
-| Windows x64 / MSVC | Release workspace, all targets: passed | 145 tests passed; one private-capture test ignored; CLI help passed |
-| Ubuntu 24.04.3 x64 / GNU | Release workspace, all targets: passed under WSL | 145 tests passed; one private-capture test ignored |
-| Windows ARM64 / MSVC | Release workspace, all targets: cross-compiled successfully from Windows x64 | Native ARM64 execution pending |
+| Windows x64 / MSVC | Workspace, all targets: passed | **165 tests passed**, one private-source test ignored; CLI help passed |
+| Ubuntu 24.04 x64 / GNU, under WSL2 | Workspace, all targets: passed | **165 tests passed**, one private-source test ignored; CLI help passed |
+| Windows ARM64 / MSVC | Workspace, all targets: cross-compiled and linked from Windows x64 | CLI and SDK test executable verified ARM64; **native ARM64 execution remains pending** |
 
-Each complete test run covers 124 codec library tests, two codec CLI tests,
-12 SDK tests (including the new numeric-localhost transport smoke test), and
-seven native-payload tests. SDK-only Windows package selection was also built
-and its 12 tests passed. The SDK is a library; the build does not execute a
-solver example or protected-site workflow.
+Each native x64 test run covers 144 codec-library tests, two CLI tests, 12 SDK
+tests and seven vendored native-payload tests. The SDK tests include the bounded,
+proxy-disabled numeric-localhost HTTP transport smoke test; native payload tests
+include the Windows/macOS captured-profile regression. No ignored private-source
+test was executed in these latest runs.
 
-## Platform selection checks
+The two x64 release codecs also matched the saved baseline and each other on
+all **38 frozen inputs** for family, shuffle key and version token. Expectations
+remain unreviewed: output equality is compatibility evidence, not independent
+proof of extraction correctness. Existing historical disagreements remain.
 
-- Windows x64 target: both the codec CLI and SDK test executable PE headers
-  identify x64 (`0x8664`).
-- Windows ARM64 target: both the codec CLI and SDK test executable PE headers
-  identify ARM64 (`0xaa64`).
-- Cargo feature graphs contain neither explicit SHA assembly feature on either
-  MSVC target; Linux x64 selects both `sha1/asm` and `sha2/asm`.
-- The pinned `wreq`, `wreq-util` and `btls` cached source checkouts used for
-  Windows validation have no tracked local modifications.
-- Cargo.lock is unchanged. Both Windows builds used Cargo `--offline --locked`.
-- Bash syntax and ShellCheck passed; PowerShell AST parsing passed.
-- Git whitespace checks passed.
+The ARM64 command compiles examples and test executables through `--all-targets`
+but does not execute them. Compiled test binaries are not counted as passed
+ARM64 tests. The SDK is a library; the verified SDK executable is its test harness,
+not a standalone solver executable.
 
-## Fixes and build configuration
+## Windows executable architecture verification
 
-The workspace no longer forces SHA assembly features globally. The vendored
-native-payload manifest selects explicit assembly only on Linux x64, avoiding
-Cargo feature unification re-enabling it on MSVC. Windows setup imports the
-appropriate MSVC compiler environment. Git Unix utilities are appended to PATH
-so their `link.exe` cannot shadow the Microsoft linker.
+PE checks read the DOS `MZ` signature, `e_lfanew`, `PE` signature, COFF Machine
+field and optional-header magic from the actual files, rather than inferring
+architecture from a directory or filename.
 
-Both build scripts support codec, SDK and workspace package selection, release
-or debug builds, and Cargo offline mode. The Windows script supports automatic
-native architecture selection or explicit x64/ARM64 targets. Cross-target test
-execution is rejected; native ARM64 testing requires a Windows ARM64 machine. Ubuntu
-selection explicitly requires release 24.04 and x86_64.
+| Artifact | COFF Machine | Optional-header magic | Result |
+| --- | --- | --- | --- |
+| Latest Windows x64 codec CLI | `0x8664` | `0x20b` / PE32+ | x64 |
+| Latest Windows x64 SDK test executable | `0x8664` | `0x20b` / PE32+ | x64 |
+| Latest Windows ARM64 codec CLI | `0xaa64` | `0x20b` / PE32+ | ARM64 |
+| Latest Windows ARM64 SDK test executable | `0xaa64` | `0x20b` / PE32+ | ARM64 |
 
-Builds and validation are manual. The optional GitHub Actions workflow was
-removed at the user's request. An optional Ubuntu 24.04 Docker build definition
-uses the same source/scripts.
+All **7 target executables** inspected under the ARM64 release root,
+`deps` and `examples` identify ARM64/PE32+. Host build-tool outputs are separate
+from these target artifacts. The x64 host's supplied `libclang.dll` was also
+verified as x64 (`0x8664`), appropriate for the host process doing binding
+generation while targeting ARM64.
 
-## Limits
+ARM64 artifacts from this run:
 
-Native Windows ARM64 tests still require a Windows ARM64 machine. The Docker definition was
-not built locally: the Docker daemon was unavailable. Ubuntu validation was
-performed in the existing Ubuntu 24.04 WSL environment, with build dependencies
-installed and an isolated temporary Rust toolchain/cache/target directory. Those
-temporary Linux outputs were unavailable after the validation session; the
-subsequent Linux CLI-help check could not run. The recorded build and 145 test
-results passed, but retained Linux artifacts and CLI-help smoke remain pending
-manual checks.
-Toolchain and Rust dependency versions are pinned, but OS packages/images are
-not pinned sufficiently to claim byte-for-byte reproducible binaries.
+| Artifact | File | SHA-256 |
+| --- | --- | --- |
+| Codec CLI | `akamai-codec.exe` | `6f2430eb6ef7d51795f2d0f27bbe1b3d6f158b9f6f6557b81faa10de24624282` |
+| SDK test harness | `akamai_solver-14f37f88f043d160.exe` | `268f8e34e02f7606fc3437b416a13e543ffc1787b2bc202dc19fac760e1fa64d` |
 
-The existing codec unused-field warning is unchanged. Passing build/unit checks
-does not resolve previously observed captured-script parsing compatibility gaps.
-No parser implementation, device telemetry or solver/submission/SBSD policy was
-changed. The only added Rust runtime exercise is a proxy-disabled HTTP GET to a
-numeric loopback server; it does not test TLS negotiation or external acceptance.
-No live website/proxy/browser tests or sensor submissions were performed.
-Dependency and toolchain downloads for Linux setup were permitted infrastructure
-traffic, not site tests. Live site/proxy tests remain paused.
+These hashes identify retained local artifacts, not a byte-for-byte
+reproducibility guarantee. No ARM64 CLI/help or test executable was launched.
 
-## Review fixes and offline follow-up
+## Reproduction and platform selection
 
-The four confirmed review findings are addressed:
+With the prerequisites and environment described in [BUILDING.md](BUILDING.md):
 
-- XP-01: reset accepted localhost sockets to blocking mode before applying read
-  and write timeouts, because Winsock inherits the listener's nonblocking mode.
-- XP-02: append both the standard Git command and Unix-utility directories,
-  preserving MSVC linker precedence.
-- XP-03: select Visual Studio installations with the C++ component required by
-  the requested x64 or ARM64 target, instead of selecting any newest instance.
-- XP-04: state each target's CLI/SDK-test PE architecture separately above.
+```powershell
+# Windows x64 native release build and tests:
+./scripts/build.ps1 -Package workspace -Offline -Test
 
-Post-fix offline Windows validation passed all 145 tests and rebuilt the full
-ARM64 workspace successfully. Git was removed from the incoming PATH; the
-script discovered Git/cmd/git.exe, and link.exe still resolved to MSVC. Updated
-CLI and SDK-test PE headers matched both target architectures. PowerShell AST,
-new Rust test formatting and whitespace checks passed. Cargo.lock is unchanged.
+# Windows x64 host: ARM64 release cross-build, without target test execution:
+./scripts/build.ps1 -Architecture arm64 -Package workspace -Offline
+```
 
-The Ubuntu results in the table are from the original implementation before
-these review fixes. Ubuntu was not rerun after the fixes because its temporary
-Rust/cache directory was no longer available and this follow-up was offline.
-Native Windows ARM64 execution and Docker validation remain pending. GitHub
-Actions remains removed; all build validation is manual. No commits or pushes
-were made during this follow-up.
+```bash
+# Ubuntu 24.04 x64 native release build and tests:
+bash scripts/build.sh --package workspace --offline --test
+```
+
+All commands use Cargo `--locked`; the recorded runs also used `--offline`.
+Fresh target directories retained previous validation outputs. Rust 1.98.1,
+the ARM64 Rust standard library and target-appropriate MSVC tools were already
+installed. Existing dependency caches were reused. Local host-native LLVM and,
+for the earlier x64 build, NASM paths were supplied. No new toolchain/dependency
+downloads were required for this ARM64 cross-build.
+
+The ARM64 run used `x64_arm64` compiler setup selected by the Windows helper.
+Current workspace Cargo feature graphs were recorded for all three targets:
+neither explicit `sha1/asm` nor `sha2/asm` is selected for either MSVC target;
+Linux x64 selects both. `Cargo.lock` and all source files were unchanged by the
+cross-build and feature inspection, before this documentation-only update.
+
+The helper rejects cross-architecture `-Test`. Native ARM64 execution requires
+a Windows ARM64 machine, its native Rust toolchain and host-compatible LLVM.
+That future validation must run the tests; successful linking and PE-header
+verification alone do not establish runtime correctness.
+
+## Review fixes retained and historical results
+
+The original build-only change was independently reviewed and its four
+confirmed findings were fixed before merge:
+
+- XP-01: reset accepted localhost sockets to blocking mode before read/write
+  timeouts, accounting for Winsock's inherited listener mode.
+- XP-02: discover both Git command and Unix-utility directories while retaining
+  MSVC linker precedence.
+- XP-03: filter Visual Studio discovery for the requested x64/ARM64 C++ toolset.
+- XP-04: identify CLI and SDK-test PE architectures separately for each target.
+
+Earlier build-branch validation reported 145 tests (124 codec library, two CLI,
+12 SDK and seven native payload) and an ARM64 cross-build. Its original Ubuntu
+run preceded those review fixes, and temporary Linux outputs later became
+unavailable. **That Ubuntu follow-up gap is now closed** by the merged-main
+release build, 165 passing tests and CLI-help check recorded above. The current
+Linux source/toolchain/cache/target environment and outputs are retained in a
+persistent validation directory. The older 145-test counts are historical, not
+the latest merged-main result.
+
+## Retained local evidence
+
+Evidence is outside the repository under the local validation root; no binaries,
+raw captures or build logs are committed:
+
+- `merged-main-validation/20261118T195016Z/`: merged-main manifest, Windows
+  and Ubuntu release build/test logs, CLI-help output, binary hashes, 38-input
+  comparisons and summary/report.
+- `arm64-main-validation/20261118T200027Z/`: ARM64 build log, pre-update source
+  manifest, PE architecture/size/hash records, all three target feature graphs,
+  the previous version of this document and summary/report.
+
+The production/build source at the validated commit was not changed. This
+update changes only the validation record; raw evidence remains outside the
+repository.
+
+## Remaining limitations and live-test state
+
+- Native Windows ARM64 runtime/tests remain pending. No ARM64 emulation result
+  or Windows ARM64 build-host validation is claimed.
+- Docker validation remains pending; it was not performed in these latest
+  runs. The earlier daemon was unavailable.
+- LLVM/libclang must match the Rust build host. The DLL used here was checked,
+  but the build helper does not proactively enforce that compatibility for
+  every machine.
+- Linux ARM64, musl, MinGW and macOS remain outside the build helpers' coverage.
+  Toolchain/dependency pins do not pin OS packages/images sufficiently to
+  guarantee reproducible binary bytes.
+- The pre-existing codec unused-field warning remains. These are build/unit
+  checks, not performance/memory benchmarks, TLS negotiation tests, live sensor
+  acceptance or GraphQL validation; parser/model limitations remain unchanged.
+
+Builds are manual. GitHub Actions remains intentionally absent. Cargo offline
+mode is not an OS network sandbox. The earlier native transport runs used
+numeric localhost with proxies disabled; the ARM64 step was compile/header
+inspection only. No solver example, protected-site workflow, browser profile,
+proxy test, sensor submission or captured-evidence replay was run.
+
+**Live website, browser and proxy tests remain paused.**
