@@ -153,6 +153,66 @@ verified dispatcher-depth arithmetic and seed handling stay isolated from the
 AST route. Any source-byte change disables this exception. This does not grant
 unknown scripts the historical name-based proof.
 
+## Rotated global-conversion layout
+
+Most rotated HomeDepot builds do not call `parseInt` on a pool element. Their
+key initializer is a chained computed call on the global object whose names
+come from runtime-decoded string tables, for example
+`G[t1()[k1(a)](...)](t2()[k2(b)](...)[...](POOL[INDEX]))`. The pool and the
+index are not declarator initializers: a flattened init dispatcher declares
+them with `var` and assigns each exactly once. Identifiers, table indices and
+pool order rotate per build; the structure does not. The recognizer keys on that
+structure only, never on names, indices, pool order or a script hash:
+
+- **Write-once constants and pools.** A binding declared without any
+  initializer and written by exactly one plain `=` to the identifier itself
+  (no compound, update, destructuring, loop-target, member or `delete` writes)
+  is write-once. Integer values of write-once bindings are evaluated in a
+  separate mode with its own memo and stored apart from proven constants, so
+  existing routes never consume them. Bindings are resolved by symbol identity,
+  so a same-named local in another function is independent. A write-once pool
+  is intact when all of its reads are index reads.
+- **Global-object alias.** Every write to `G` assigns `window`, `global`,
+  `self`, `globalThis` or `this`. A direct member write or `delete` through the
+  alias (`G[x]=...`), or replacing it as a global property, rejects; nested
+  writes (`G[x][y]=...`) are permitted.
+- **Exact chain shape.** One argument at each call; the three name expressions
+  are side-effect free (references, literals, calls, member reads,
+  `typeof`/`!`/unary `+`/`-`/`void`, equality, `+`, conditionals; no assignment,
+  update, `delete`, function, `new`, sequence, spread or template); the inner
+  argument is exactly `POOL[identifier-or-literal]`; and the whole initializer
+  reads a pool owner exactly once, at that operand. Arithmetic or unary
+  operators around the chain, extra arguments, two-argument table decoys and
+  nested index lookups are not this shape.
+- **Key binding.** The key must be a stable binding. A pair inside a closure
+  nested in the key's own function may be written before the initializer
+  (a deferred read); a straight-line read before the initializer in the same
+  function still rejects. The proven bound-initializer route keeps its strict
+  ordering rule.
+- **Precedence.** Results use the separate method `opaque_global_conversion`
+  and candidate list `conversion_initializers`. They rank after proven bound
+  initializers, must agree with a proven candidate or a single registered pool,
+  must be unique, and must decode below 2^24.
+
+The conversion names are opaque, so value preservation of the chain (for
+example a `Number`/`concat` pair) is an assumption, not a proof; dispatcher
+execution order is also not proven. A future change to the chain's shape fails
+closed.
+
+Registration detection was also made rotation-safe. Arrays passed to an
+immediately invoked function are treated as getter registrations only when the
+u32 anchor is the head, or is one slot late and followed by the 65,793
+multiplier (a corrupted head, which still fails closed). Rotated constant
+tables that merely hold the anchor at index 1 no longer report a malformed
+registration.
+
+On the 36 saved corpus fixtures, the change adds a shuffle key to 24 scripts and
+changes no other report field. Fifteen of the seventeen previously missing
+historical key candidates are now matched; the two remaining scripts use a
+lazy-getter layout that still rejects, as does one script with a shifted
+registration array. These are unreviewed observations; the historical values
+are not ground truth.
+
 ## Offline validation
 
 All 85 existing codec tests are retained, with thirty-nine additional AST precision,
@@ -164,6 +224,15 @@ helper kinds. Additional cases verify initializer ordering, function hoisting,
 complete seed argument expressions, declaration forms, Annex B, template decoys,
 conditional pushes, bounded XOR success/exhaustion and actual AST arrays for key-pair evidence. A synthetic version-table fixture was wrapped in a function to
 make its formerly top-level `return` valid JavaScript.
+
+Seven further tests (131 passing) cover the rotated global-conversion layout
+with a synthetic full-shape fixture, `homedepot_rotated_global_conversion.js`:
+identifier renaming, pool reordering with a different write-once index
+expression, alternate alias assignments and nested alias writes; rejection of
+transformed chains, decoys, pool-reading or side-effecting names, non-global
+receivers, multiply written or member-written indexes, pools and aliases,
+straight-line key use before initialization, reassigned keys and disagreeing
+candidates; and rotated constant arrays that are not registrations.
 
 Complete private saved scripts retain fresh key 8,682,175 and legacy key
 4,881,225 and the expected versions; modified legacy sources reject. Four

@@ -199,8 +199,29 @@ fn compile_lookup_plan<'a>(
         pool.get(number(t[2], constants)?)?.as_str(),
     ))
 }
+/// Lookup operand of a recognized global conversion chain `G[a](b[c](pool[i]))`.
+/// The pool may be a proven-stable or write-once binding, and the index may be a
+/// proven or write-once constant. The conversion itself is opaque (its names are
+/// runtime-decoded), so results from this plan are reported separately.
+fn compile_conversion_lookup<'a>(
+    t: &[&str],
+    pools: &BTreeMap<SymbolId, &'a Vec<String>>,
+    constants: &Numbers,
+    ast: &Analysis,
+) -> Option<LookupPlan<'a>> {
+    if t.len() != 4 || t[1] != "[" || t[3] != "]" || !ast.write_once_or_stable(t[0]) {
+        return None;
+    }
+    let pool = *pools.get(&ast.symbol(t[0])?)?;
+    let index = literal_arrays::decimal_integer(t[2])
+        .or_else(|| constants.get_write_once(t[2]).copied())
+        .and_then(|n| usize::try_from(n).ok())?;
+    Some(LookupPlan::Encoded(pool.get(index)?.as_str()))
+}
 struct PreparedKeyInitializer<'a> {
     plan: Option<LookupPlan<'a>>,
+    conversion: Option<LookupPlan<'a>>,
+    conversion_binding_invalid: bool,
     reads_pool: bool,
     invalid_binding: bool,
     unsafe_pool: bool,
@@ -320,7 +341,16 @@ fn analyze_with_limits(
         .into_iter()
         .flat_map(|a| a.key_pairs.iter().filter(|p| !p.1).map(|p| p.0))
         .collect();
+    // The opaque-conversion route also tolerates deferred closure reads of a
+    // stable key binding; a straight-line read before its initializer still
+    // makes the binding unusable.
+    let unusable_conversion_pairs: BTreeSet<_> = analysis
+        .as_ref()
+        .into_iter()
+        .flat_map(|a| a.key_pairs.iter().filter(|p| !p.1 && !p.2).map(|p| p.0))
+        .collect();
     let mut candidates = BTreeSet::new();
+    let mut conversion_candidates = BTreeSet::new();
     let mut sentinel_candidates = BTreeSet::new();
     let mut registered_candidates = BTreeSet::new();
     let mut malformed_registration = false;
@@ -345,11 +375,18 @@ fn analyze_with_limits(
             }
         }
         let read_positions = ast.derived_read_positions(pools.keys().copied());
+        let owner_positions = ast.owner_read_positions(pools.keys().copied());
         let unproven_pool_read = ast
             .unproven_key_writes
             .iter()
             .any(|span| Analysis::has_indexed_read(&read_positions, *span));
-        (pools, unsafe_owners, read_positions, unproven_pool_read)
+        (
+            pools,
+            unsafe_owners,
+            read_positions,
+            unproven_pool_read,
+            owner_positions,
+        )
     });
     unsupported_bound_lookup |= pool_facts.as_ref().is_some_and(|facts| facts.3);
     // Tokenization, binding/poison checks and pool reads do not depend on the
@@ -359,7 +396,7 @@ fn analyze_with_limits(
         remaining: plan_work,
         exhausted: false,
     };
-    if let (Some(ast), Some((pools, unsafe_owners, read_positions, _))) =
+    if let (Some(ast), Some((pools, unsafe_owners, read_positions, _, owner_positions))) =
         (analysis.as_ref(), pool_facts.as_ref())
     {
         for initializer in &ast.initializers {
@@ -422,8 +459,30 @@ fn analyze_with_limits(
             if work.exhausted {
                 break;
             }
+            // The chain must read a pool owner exactly once, at its lookup
+            // operand (the opaque name expressions may not read a pool), and be
+            // called through a global-object alias.
+            let conversion_binding_invalid = !ast.stable(var)
+                || ast
+                    .symbol(var)
+                    .is_some_and(|id| unusable_conversion_pairs.contains(&id));
+            let conversion = initializer
+                .conversion
+                .filter(|_| plan.is_none() && initializer.simple)
+                .filter(|(global, _)| ast.global_object_alias_at(*global))
+                .filter(|(_, lookup)| {
+                    Analysis::indexed_reads_in(owner_positions, initializer.expression) == 1
+                        && Analysis::indexed_reads_in(owner_positions, *lookup) == 1
+                })
+                .and_then(|(_, lookup)| {
+                    let lookup_tokens =
+                        literal_arrays::tokens(&source[lookup.start as usize..lookup.end as usize]);
+                    compile_conversion_lookup(&lookup_tokens, pools, constants, ast)
+                });
             prepared_initializers.push(PreparedKeyInitializer {
                 plan,
+                conversion,
+                conversion_binding_invalid,
                 reads_pool,
                 invalid_binding,
                 unsafe_pool,
@@ -459,11 +518,15 @@ fn analyze_with_limits(
                     .as_ref()
                     .is_some_and(|a| a.is_registered_array(*offset))
             };
-            if invocation
-                && a.iter()
-                    .take(2)
-                    .any(|v| bind_numeric_anchor(&map, v, b"4294967295.000000").is_some())
-            {
+            // The getter ABI starts with the u32 anchor. A head shifted by one
+            // slot ([x, u32, 65793, ...]) is a corrupted registration and fails
+            // closed. Rotated constant arrays that merely hold the anchor at
+            // index 1 without the multiplier after it are not registrations.
+            let anchor = |v: &String| bind_numeric_anchor(&map, v, b"4294967295.000000").is_some();
+            let registration_head = a.first().is_some_and(anchor)
+                || (a.get(1).is_some_and(anchor)
+                    && a.get(2).and_then(|v| decode_numeric_key(v, &map)) == Some(65_793));
+            if invocation && registration_head {
                 if a.len() < 3
                     || bind_numeric_anchor(&map, &a[0], b"4294967295.000000").is_none()
                     || decode_numeric_key(&a[1], &map) != Some(65_793)
@@ -506,10 +569,19 @@ fn analyze_with_limits(
                 .plan
                 .as_ref()
                 .and_then(|plan| plan.decode(&map, &mut decoded_values));
+            let converted = initializer
+                .conversion
+                .as_ref()
+                .and_then(|plan| plan.decode(&map, &mut decoded_values))
+                .filter(|key| *key < 1 << 24);
             if let Some(value) = proven {
                 unsafe_key |= initializer.invalid_binding;
                 unsafe_pool |= initializer.unsafe_pool;
                 candidates.insert(value);
+            } else if let Some(value) = converted {
+                unsafe_key |= initializer.conversion_binding_invalid;
+                unsafe_pool |= initializer.unsafe_pool;
+                conversion_candidates.insert(value);
             } else if initializer.reads_pool {
                 unsupported_bound_lookup = true;
                 for encoded in &initializer.lookup_operands {
@@ -533,10 +605,27 @@ fn analyze_with_limits(
         && candidates.first() != registered_candidates.first()
     {
         (None, "conflicting_extraction_strategies")
+    } else if candidates.len() == 1
+        && !conversion_candidates.is_empty()
+        && conversion_candidates != candidates
+    {
+        (None, "conflicting_extraction_strategies")
     } else if candidates.len() == 1 {
         (candidates.first().copied(), "unique_bound_initializer")
     } else if !candidates.is_empty() {
         (None, "ambiguous_bound_initializers")
+    } else if conversion_candidates.len() == 1
+        && registered_candidates.len() == 1
+        && conversion_candidates != registered_candidates
+    {
+        (None, "conflicting_extraction_strategies")
+    } else if conversion_candidates.len() == 1 {
+        (
+            conversion_candidates.first().copied(),
+            "opaque_global_conversion",
+        )
+    } else if !conversion_candidates.is_empty() {
+        (None, "ambiguous_conversion_initializers")
     } else if registered_candidates.len() == 1 {
         let key = *registered_candidates.first().unwrap();
         if unsupported_lookup_values.contains(&key) {
@@ -567,6 +656,10 @@ fn analyze_with_limits(
         method,
         candidates: BTreeMap::from([
             ("bound_initializers", candidates.into_iter().collect()),
+            (
+                "conversion_initializers",
+                conversion_candidates.into_iter().collect(),
+            ),
             (
                 "registered_pools",
                 registered_candidates.into_iter().collect(),
@@ -1350,5 +1443,247 @@ mod tests {
         let result = analyze(&format!("{source}{nested}"));
         assert_eq!(result.key, None);
         assert_eq!(result.method, "initializer_plan_budget_exhausted");
+    }
+
+    const ROTATED: &str = include_str!("fixtures/homedepot_rotated_global_conversion.js");
+    const ROTATED_KEY: &str = "var keyValue=";
+
+    #[test]
+    fn rotated_global_conversion_chain_reads_the_bound_pool_element() {
+        let result = analyze(ROTATED);
+        assert_eq!(result.key, Some(9_618_129));
+        assert_eq!(result.method, "opaque_global_conversion");
+        assert_eq!(
+            result.candidates["conversion_initializers"],
+            vec![9_618_129]
+        );
+        assert!(result.candidates["bound_initializers"].is_empty());
+    }
+
+    #[test]
+    fn rotated_layout_survives_renaming_reordering_and_index_rotation() {
+        // Rename every identifier, move the key to another pool slot with a
+        // different write-once index expression, and swap the alias order.
+        let renamed = [
+            ("gAlias", "zM"),
+            ("cOne", "z9"),
+            ("cTwo", "Sl"),
+            ("cIdx", "Z9"),
+            ("numPool", "xL"),
+            ("tblRead", "qV"),
+            ("tblKeys", "R8f"),
+            ("tblNames", "Z5"),
+            ("tblHelp", "sK"),
+            ("keyValue", "VPf"),
+            ("keyPair", "znf"),
+            ("useKey", "cnf"),
+            ("cmpSame", "Ax"),
+            ("session", "Lgf"),
+        ]
+        .iter()
+        .fold(ROTATED.to_owned(), |s, (a, b)| s.replace(a, b));
+        assert_eq!(extract_shuffle_key(&renamed), Some(9_618_129));
+        let moved = renamed
+            .replace(
+                "[\"noise\",\"JbBmBvJ\"]",
+                "[\"x9\",\"noise\",\"y7\",\"JbBmBvJ\"]",
+            )
+            .replace("Z9=Sl-z9;", "Z9=Sl*Sl-z9;");
+        assert_eq!(extract_shuffle_key(&moved), Some(9_618_129));
+        let swapped = moved.replace(
+            "if(typeof window!=='undefined'){zM=window;}else if(typeof global!=='undefined'){zM=global;}else{zM=this;}",
+            "zM=typeof globalThis!=='undefined'?globalThis:this;",
+        );
+        // A conditional right-hand side is not a plain global-object write.
+        assert_eq!(extract_shuffle_key(&swapped), None);
+        let self_alias = moved.replace(
+            "if(typeof window!=='undefined'){zM=window;}else if(typeof global!=='undefined'){zM=global;}else{zM=this;}",
+            "if(typeof self!=='undefined'){zM=self;}else{zM=globalThis;}",
+        );
+        assert_eq!(extract_shuffle_key(&self_alias), Some(9_618_129));
+        // Nested writes into objects reached through the global do not
+        // replace the alias's own properties.
+        let nested = moved.replacen(
+            "return cnf;}",
+            "zM[z9][Sl]=z9;zM[z9].bmak[Sl]=z9;return cnf;}",
+            1,
+        );
+        assert_ne!(nested, moved);
+        assert_eq!(extract_shuffle_key(&nested), Some(9_618_129));
+    }
+
+    #[test]
+    fn rotated_conversion_rejects_transformed_or_unverifiable_shapes() {
+        let key = ROTATED.find(ROTATED_KEY).unwrap() + ROTATED_KEY.len();
+        let end = ROTATED[key..].find(";return useKey").unwrap() + key;
+        let initializer = &ROTATED[key..end];
+        for (label, changed) in [
+            ("arithmetic around the chain", format!("{initializer}+1")),
+            ("unary around the chain", format!("-{initializer}")),
+            (
+                "extra outer argument",
+                initializer.replacen("](tblHelp()", "](0,tblHelp()", 1),
+            ),
+            (
+                "two-argument decoy",
+                initializer.replace("(numPool[cIdx]))", "(numPool[cIdx]),cOne)"),
+            ),
+            (
+                "table index instead of value",
+                initializer.replace("(numPool[cIdx])", "(lookup[numPool[cIdx]])"),
+            ),
+            (
+                "name reads the pool",
+                initializer.replacen("tblRead(cOne)", "numPool[cOne]", 1),
+            ),
+            (
+                "name has a side effect",
+                initializer.replacen("tblRead(cOne)", "(cOne=cTwo)", 1),
+            ),
+            (
+                "name defines a function",
+                initializer.replacen("tblRead(cOne)", "function(){}", 1),
+            ),
+            (
+                "non-global receiver",
+                initializer.replacen("gAlias[", "local[", 1),
+            ),
+        ] {
+            let source = ROTATED.replacen(initializer, &changed, 1);
+            assert_eq!(extract_shuffle_key(&source), None, "{label}");
+        }
+    }
+
+    #[test]
+    fn rotated_conversion_requires_write_once_global_facts() {
+        for (label, from, to) in [
+            (
+                "index written twice",
+                "cIdx=cTwo-cOne;",
+                "cIdx=cTwo-cOne;cIdx=cOne;",
+            ),
+            (
+                "index compound write",
+                "cIdx=cTwo-cOne;",
+                "cIdx=cTwo;cIdx-=cOne;",
+            ),
+            ("index updated", "cIdx=cTwo-cOne;", "cIdx=cTwo-cOne;cIdx++;"),
+            (
+                "index loop target",
+                "cIdx=cTwo-cOne;",
+                "cIdx=cTwo-cOne;for(cIdx in power){}",
+            ),
+            (
+                "pool written twice",
+                "numPool=decode",
+                "numPool=[];numPool=decode",
+            ),
+            (
+                "pool escapes",
+                "return useKey;}",
+                "consume(numPool);return useKey;}",
+            ),
+            (
+                "pool member write",
+                "return useKey;}",
+                "numPool[cOne]='JbBmBvJ';return useKey;}",
+            ),
+            (
+                "alias also assigned elsewhere",
+                "gAlias=this;}",
+                "gAlias=this;}gAlias=other;",
+            ),
+            (
+                "alias member written",
+                "return useKey;}",
+                "gAlias[cOne]=cTwo;return useKey;}",
+            ),
+            (
+                "alias member deleted",
+                "return useKey;}",
+                "delete gAlias[cOne];return useKey;}",
+            ),
+            (
+                "alias replaced on global",
+                "return useKey;}",
+                "window.gAlias=cOne;return useKey;}",
+            ),
+            (
+                "index declared with initializer",
+                "var gAlias,cOne,cTwo,cIdx,numPool;",
+                "var gAlias,cOne,cTwo,numPool;var cIdx=0;",
+            ),
+        ] {
+            let source = ROTATED.replacen(from, to, 1);
+            assert_ne!(source, ROTATED, "{label}");
+            assert_eq!(extract_shuffle_key(&source), None, "{label}");
+        }
+    }
+
+    #[test]
+    fn rotated_conversion_key_binding_order_and_stability() {
+        // A straight-line read of the key before its initializer, in the same
+        // function, is not a deferred closure read.
+        let straight = ROTATED.replacen(
+            "var useKey=function(){var keyPair=[session,keyValue];return keyPair;};",
+            "var keyPair=[session,keyValue];var useKey=function(){return keyPair;};",
+            1,
+        );
+        assert_eq!(extract_shuffle_key(&straight), None);
+        let reassigned = ROTATED.replacen(";return useKey;}", ";keyValue=cOne;return useKey;}", 1);
+        assert_eq!(extract_shuffle_key(&reassigned), None);
+        // The proven bound-initializer route keeps its strict ordering rule.
+        let proven = ROTATED.replacen(
+            ROTATED_KEY,
+            "var keyValue=parseInt(numPool[cIdx]);var unused=",
+            1,
+        );
+        assert_ne!(analyze(&proven).method, "unique_bound_initializer");
+    }
+
+    #[test]
+    fn rotated_conversion_candidates_must_agree() {
+        let key = ROTATED.find(ROTATED_KEY).unwrap() + ROTATED_KEY.len();
+        let end = ROTATED[key..].find(";return useKey").unwrap() + key;
+        let initializer = &ROTATED[key..end];
+        // A second decodable element ("bJBmBvJ") read by a second chain.
+        let second = format!(
+            ";var otherValue={};var otherPair=[session,otherValue]",
+            initializer.replace("numPool[cIdx]", "numPool[0]")
+        );
+        let ambiguous = ROTATED.replace("\"noise\"", "\"bJBmBvJ\"").replacen(
+            ";return useKey",
+            &format!("{second};return useKey"),
+            1,
+        );
+        assert_eq!(extract_shuffle_key(&ambiguous), None);
+        assert_eq!(
+            analyze(&ambiguous).method,
+            "ambiguous_conversion_initializers"
+        );
+        let agreeing = ambiguous.replace("numPool[0]", "numPool[cIdx]");
+        assert_eq!(extract_shuffle_key(&agreeing), Some(9_618_129));
+        // A single registered getter pool must agree with the conversion.
+        let registered = include_str!("fixtures/homedepot_5d7_short_registration.js");
+        let conflicting = analyze(&format!("{registered}\n{ROTATED}"));
+        assert_eq!(conflicting.key, None);
+    }
+
+    #[test]
+    fn rotated_constant_arrays_are_not_registrations() {
+        // An immediately-invoked constant array with the u32 anchor at index 1
+        // and no multiplier after it is a rotated constant table.
+        let anchors = "var power=[\"BNNN\"];var anchors_a=[\"3vJ3JbHvJM7NNNNNN\"];var anchors_b=[\"mrmmbNH7NNNNNN\", \"bMMrM7NNNNNN\"];";
+        let table = format!(
+            "{anchors}(function(t){{return t;}}([\"J\",\"3vJ3JbHvJM7NNNNNN\",\"mrmmbNH7NNNNNN\"]));"
+        );
+        let result = analyze(&format!("{table}\n{ROTATED}"));
+        assert_eq!(result.key, Some(9_618_129));
+        // A head shifted by one slot before the multiplier still fails closed.
+        let source = include_str!("fixtures/homedepot_5d7_short_registration.js");
+        assert_eq!(
+            analyze(&source.replace("}([", "}(['bad',")).method,
+            "malformed_registered_pool"
+        );
     }
 }
