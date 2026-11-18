@@ -354,6 +354,7 @@ fn analyze_with_limits(
     let mut sentinel_candidates = BTreeSet::new();
     let mut registered_candidates = BTreeSet::new();
     let mut malformed_registration = false;
+    let mut shifted_anchor_without_multiplier = false;
     let mut unsafe_pool = false;
     let mut unsafe_key = false;
     let mut legacy_candidates = BTreeSet::new();
@@ -518,14 +519,16 @@ fn analyze_with_limits(
                     .as_ref()
                     .is_some_and(|a| a.is_registered_array(*offset))
             };
-            // The getter ABI starts with the u32 anchor. A head shifted by one
-            // slot ([x, u32, 65793, ...]) is a corrupted registration and fails
-            // closed. Rotated constant arrays that merely hold the anchor at
-            // index 1 without the multiplier after it are not registrations.
+            // Only the opaque-conversion route may treat a table with the
+            // anchor at index 1 and no multiplier as an unrelated constant
+            // table. Other routes retain the original malformed-registration
+            // rejection, including a shifted head plus a corrupt multiplier.
             let anchor = |v: &String| bind_numeric_anchor(&map, v, b"4294967295.000000").is_some();
             let registration_head = a.first().is_some_and(anchor)
                 || (a.get(1).is_some_and(anchor)
                     && a.get(2).and_then(|v| decode_numeric_key(v, &map)) == Some(65_793));
+            shifted_anchor_without_multiplier |=
+                invocation && a.get(1).is_some_and(anchor) && !registration_head;
             if invocation && registration_head {
                 if a.len() < 3
                     || bind_numeric_anchor(&map, &a[0], b"4294967295.000000").is_none()
@@ -592,11 +595,19 @@ fn analyze_with_limits(
             }
         }
     }
+    // The relaxed registration classification is scoped to a result that can
+    // only be selected by the new conversion route. It must not rescue bound,
+    // registration, legacy or sentinel routes from a damaged registration.
+    let conversion_registration_exception = candidates.is_empty()
+        && conversion_candidates.len() == 1
+        && (registered_candidates.is_empty() || registered_candidates == conversion_candidates);
     let (key, method) = if unsafe_key {
         (None, "mutable_key_binding")
     } else if unsafe_pool {
         (None, "mutable_or_aliased_pool")
-    } else if malformed_registration {
+    } else if malformed_registration
+        || (shifted_anchor_without_multiplier && !conversion_registration_exception)
+    {
         (None, "malformed_registered_pool")
     } else if registered_candidates.len() > 1 {
         (None, "ambiguous_registered_pools")
@@ -1638,7 +1649,7 @@ mod tests {
             "var keyValue=parseInt(numPool[cIdx]);var unused=",
             1,
         );
-        assert_ne!(analyze(&proven).method, "unique_bound_initializer");
+        assert_eq!(analyze(&proven).key, None);
     }
 
     #[test]
@@ -1667,6 +1678,7 @@ mod tests {
         let registered = include_str!("fixtures/homedepot_5d7_short_registration.js");
         let conflicting = analyze(&format!("{registered}\n{ROTATED}"));
         assert_eq!(conflicting.key, None);
+        assert_eq!(conflicting.method, "conflicting_extraction_strategies");
     }
 
     #[test]
@@ -1685,5 +1697,403 @@ mod tests {
             analyze(&source.replace("}([", "}(['bad',")).method,
             "malformed_registered_pool"
         );
+    }
+
+    #[test]
+    fn regression_shifted_registration_with_bad_multiplier_rejects_sentinel() {
+        let source = include_str!("fixtures/homedepot_5d7_short_registration.js");
+        for bad_multiplier in ["'badMultiplier'", "'U'"] {
+            let corrupted = source
+                .replace("}([", "}(['bad',")
+                .replace("'IGtsk'", bad_multiplier);
+            let result = analyze(&corrupted);
+            assert_eq!(result.key, None, "{bad_multiplier}");
+            assert_eq!(result.method, "malformed_registered_pool");
+        }
+    }
+
+    #[test]
+    fn regression_direct_global_converter_writes_and_deletes_reject() {
+        for global in ["window", "self", "globalThis", "global", "this"] {
+            for mutation in [
+                format!("{global}[name]=replacement;"),
+                format!("{global}.converter=replacement;"),
+                format!("delete {global}[name];"),
+                format!("{global}[name]++;"),
+                format!("{global}[name]+=replacement;"),
+                format!("[ {global}[name] ]=replacement;"),
+                format!("for({global}[name] of replacements){{}}"),
+            ] {
+                let result = analyze(&format!("{mutation}\n{ROTATED}"));
+                assert_eq!(result.key, None, "{mutation}");
+            }
+        }
+        // A nested object write does not replace a property on the global.
+        for global in ["window", "self", "globalThis", "global", "this"] {
+            assert_eq!(
+                extract_shuffle_key(&format!("{global}.child[name]=replacement;\n{ROTATED}")),
+                Some(9_618_129)
+            );
+        }
+        // Local `window` and method `this` are not the global object.
+        // A this-only local writer alias is also not a proven global receiver.
+        for unrelated in [
+            "function unrelated(window){window[name]=replacement;}",
+            "var obj={method:function(){this[name]=replacement;}};",
+            "var obj={method:function(){var H;H=this;H[name]=replacement;}};",
+            "var obj={method:function(){var H=this;H[name]=replacement;}};",
+            "var obj={method:function(){(()=>{this[name]=replacement;})();}};",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(&format!("{unrelated}\n{ROTATED}")),
+                Some(9_618_129)
+            );
+        }
+        // A top-level arrow inherits the global `this`.
+        assert_eq!(
+            extract_shuffle_key(&format!("(()=>{{this[name]=replacement;}})();\n{ROTATED}")),
+            None
+        );
+    }
+
+    #[test]
+    fn regression_this_only_alias_needs_a_named_global_assignment() {
+        let environment = "if(typeof window!=='undefined'){gAlias=window;}else if(typeof global!=='undefined'){gAlias=global;}else{gAlias=this;}";
+        for assignment in [
+            "gAlias=this;",
+            "var obj={method:function(){gAlias=this;}};",
+            "var obj={method:function(){(()=>{gAlias=this;})();}};",
+        ] {
+            let source = ROTATED.replacen(environment, assignment, 1);
+            assert_ne!(source, ROTATED);
+            assert_eq!(extract_shuffle_key(&source), None, "{assignment}");
+        }
+        assert_eq!(extract_shuffle_key(ROTATED), Some(9_618_129));
+    }
+
+    #[test]
+    fn regression_parameters_are_not_assigned_once_constants() {
+        let source = ROTATED
+            .replace(
+                "var gAlias,cOne,cTwo,cIdx,numPool;",
+                "var gAlias,cOne,cTwo,numPool;",
+            )
+            .replace("cIdx=cTwo-cOne;", "");
+        for signature in [
+            "function body(session,cIdx){",
+            "function body(session,cIdx=0){",
+            "function body(session,{cIdx}){",
+            "function body(session,...cIdx){",
+            "var body=(session,cIdx)=>{",
+        ] {
+            let changed = source.replacen(
+                "function body(session){",
+                &format!("{signature}cIdx=cTwo-cOne;"),
+                1,
+            );
+            assert_eq!(extract_shuffle_key(&changed), None, "{signature}");
+        }
+        for parameter in ["cIdx", "{cIdx}"] {
+            let changed = source
+                .replacen("function body(session){", &format!("function body(session){{try{{throw [];}}catch({parameter}){{cIdx=cTwo-cOne;"), 1)
+                .replacen(";return useKey;}", ";return useKey;}}", 1);
+            assert_eq!(extract_shuffle_key(&changed), None, "catch({parameter})");
+        }
+    }
+
+    #[test]
+    fn regression_conversion_keeps_normal_initializer_ordering() {
+        let source = ROTATED
+            .replace(
+                "var gAlias,cOne,cTwo,cIdx,numPool;",
+                "var gAlias,cOne,cTwo,numPool;",
+            )
+            .replace("cIdx=cTwo-cOne;", "");
+        let late = source.replacen(";return useKey;}", ";var cIdx=1;return useKey;}", 1);
+        assert_eq!(extract_shuffle_key(&late), None);
+        let early = source.replacen(
+            "function body(session){",
+            "function body(session){var cIdx=1;",
+            1,
+        );
+        assert_eq!(extract_shuffle_key(&early), Some(9_618_129));
+        // Relaxing ordering for an assigned-once index must not relax it for
+        // a normal initialized dependency used to compute that index.
+        let late_dependency = source
+            .replacen(
+                "function body(session){",
+                "function body(session){var cIdx;cIdx=cLate;",
+                1,
+            )
+            .replacen(";return useKey;}", ";var cLate=1;return useKey;}", 1);
+        assert_eq!(extract_shuffle_key(&late_dependency), None);
+    }
+
+    #[test]
+    fn regression_second_global_alias_cannot_replace_converter() {
+        let mut accepted = Vec::new();
+        for mutation in [
+            "var secondAlias;secondAlias=window;secondAlias[name]=replacement;",
+            "var secondAlias;secondAlias=self;delete secondAlias[name];",
+            "var secondAlias;secondAlias=globalThis;secondAlias[name]++;",
+            "var secondAlias=window;secondAlias[name]=replacement;",
+            "var secondAlias=this;delete secondAlias[name];",
+        ] {
+            if extract_shuffle_key(&format!("{mutation}\n{ROTATED}")).is_some() {
+                accepted.push(mutation);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "unsafe alias writes accepted: {accepted:?}"
+        );
+        assert_eq!(
+            extract_shuffle_key(&format!(
+                "var H;H=window;H.child[name]=replacement;\n{ROTATED}"
+            )),
+            Some(9_618_129)
+        );
+    }
+
+    #[test]
+    fn regression_reassigned_global_names_cannot_qualify_aliases() {
+        let mut accepted = Vec::new();
+        for name in ["window", "self", "globalThis", "global"] {
+            let mutation = format!("{name}=replacement;\n{ROTATED}");
+            if extract_shuffle_key(&mutation).is_some() {
+                accepted.push(name);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "reassigned globals accepted: {accepted:?}"
+        );
+        for unrelated in [
+            "function other(globalThis){globalThis=replacement;}",
+            "window.child.globalThis=replacement;",
+            "var object={method:function(){this.globalThis=replacement;}};",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(&format!("{unrelated}\n{ROTATED}")),
+                Some(9_618_129)
+            );
+        }
+    }
+
+    #[test]
+    fn regression_loop_and_self_name_bindings_have_implicit_values() {
+        let source = ROTATED
+            .replace(
+                "var gAlias,cOne,cTwo,cIdx,numPool;",
+                "var gAlias,cOne,cTwo,numPool;",
+            )
+            .replace("cIdx=cTwo-cOne;", "");
+        let cases = [
+            (
+                "for-in var",
+                source.replacen(
+                    "function body(session){",
+                    "function body(session){for(var cIdx in input){}cIdx=cTwo-cOne;",
+                    1,
+                ),
+            ),
+            (
+                "for-of let",
+                source.replacen(
+                    "function body(session){",
+                    "for(let cIdx of input){cIdx=cTwo-cOne;function body(session){",
+                    1,
+                ) + "}",
+            ),
+            (
+                "function self-name",
+                source.replacen(
+                    "function body(session){",
+                    "var body=function cIdx(session){cIdx=cTwo-cOne;",
+                    1,
+                ),
+            ),
+            (
+                "class self-name",
+                source
+                    .replacen(
+                        "function body(session){",
+                        "var body=class cIdx{method(session){cIdx=cTwo-cOne;",
+                        1,
+                    )
+                    .replacen(";return useKey;}", ";return useKey;}};", 1),
+            ),
+        ];
+        let accepted: Vec<_> = cases
+            .iter()
+            .filter(|(_, s)| extract_shuffle_key(s).is_some())
+            .map(|(label, _)| *label)
+            .collect();
+        assert!(
+            accepted.is_empty(),
+            "implicitly initialized bindings accepted: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn regression_class_keys_and_heritage_keep_outer_this() {
+        let mut accepted = Vec::new();
+        for mutation in [
+            "class C extends (this[name]=replacement,Object){}",
+            "class C{[this[name]=replacement](){}}",
+            "class C{[this[name]=replacement]=1;}",
+            "class C{[(()=>{this[name]=replacement;return 'slot';})()]=1;}",
+        ] {
+            if extract_shuffle_key(&format!("{mutation}\n{ROTATED}")).is_some() {
+                accepted.push(mutation);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "global this writes inside class syntax accepted: {accepted:?}"
+        );
+        for unrelated in [
+            "class C{field=(this[name]=replacement);}",
+            "class C{static field=(this[name]=replacement);}",
+            "class C{static{this[name]=replacement;}}",
+            "class C{field=()=>{this[name]=replacement;};}",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(&format!("{unrelated}\n{ROTATED}")),
+                Some(9_618_129),
+                "{unrelated}"
+            );
+        }
+    }
+
+    #[test]
+    fn regression_optional_chain_global_deletes_reject() {
+        for name in ["window", "self", "globalThis", "global", "this", "gAlias"] {
+            let changed = ROTATED.replacen(
+                "return useKey;}",
+                &format!("delete {name}?.[cOne];return useKey;}}"),
+                1,
+            );
+            // `this` inside body() is not the classic-script global.
+            if name == "this" {
+                assert_eq!(
+                    extract_shuffle_key(&format!("delete this?.[name];\n{ROTATED}")),
+                    None
+                );
+            } else {
+                assert_eq!(extract_shuffle_key(&changed), None, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn regression_self_referencing_global_properties_reject_mutations() {
+        let mut accepted = Vec::new();
+        for mutation in [
+            "window.self[name]=replacement;",
+            "globalThis.window[name]=replacement;",
+            "self.globalThis[name]=replacement;",
+            "delete window.window[name];",
+            "window['self'][name]=replacement;",
+            "gAlias.globalThis[name]=replacement;",
+            "this.window[name]=replacement;",
+            "window.self.globalThis.window[name]=replacement;",
+        ] {
+            // The alias is only used as a writer after its assignments.
+            let changed = if mutation.starts_with("gAlias") {
+                ROTATED.replacen(
+                    "function body(session){",
+                    &format!("{mutation}function body(session){{"),
+                    1,
+                )
+            } else {
+                format!("{mutation}\n{ROTATED}")
+            };
+            if extract_shuffle_key(&changed).is_some() {
+                accepted.push(mutation);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "self-referencing global mutations accepted: {accepted:?}"
+        );
+        for unrelated in [
+            "window.child.self[name]=replacement;",
+            "var obj={method:function(){this.self[name]=replacement;}};",
+            "function local(window){window.self[name]=replacement;}",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(&format!("{unrelated}\n{ROTATED}")),
+                Some(9_618_129)
+            );
+        }
+    }
+
+    #[test]
+    fn regression_self_path_alias_sources_reject_mutations() {
+        let mut accepted = Vec::new();
+        for mutation in [
+            "var H;H=window.self;H[name]=replacement;",
+            "var H=globalThis.window;delete H[name];",
+            "var H=window.self.globalThis.window;H[name]++;",
+            "var H=this.self;H[name]=replacement;",
+            "var H=window?.self;H[name]=replacement;",
+            "var H;function change(){H[name]=replacement;}H=window.self;",
+        ] {
+            if extract_shuffle_key(&format!("{mutation}\n{ROTATED}")).is_some() {
+                accepted.push(mutation);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "self-path alias sources accepted: {accepted:?}"
+        );
+        let environment = "if(typeof window!=='undefined'){gAlias=window;}else if(typeof global!=='undefined'){gAlias=global;}else{gAlias=this;}";
+        let unsupported_receiver = ROTATED.replacen(environment, "gAlias=window.self;", 1);
+        assert_ne!(unsupported_receiver, ROTATED);
+        assert_eq!(extract_shuffle_key(&unsupported_receiver), None);
+        for unrelated in [
+            "var H=window.child.self;H[name]=replacement;",
+            "function local(window){var H=window.self;H[name]=replacement;}",
+            "var obj={method:function(){var H=this.self;H[name]=replacement;}};",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(&format!("{unrelated}\n{ROTATED}")),
+                Some(9_618_129)
+            );
+        }
+    }
+
+    #[test]
+    fn regression_parenthesized_optional_self_paths_reject_mutations() {
+        let mut accepted = Vec::new();
+        for mutation in [
+            "(window?.self)[name]=replacement;",
+            "delete (globalThis?.window)[name];",
+            "delete (gAlias?.self)[name];",
+            "(window?.self).globalThis[name]++;",
+        ] {
+            let changed = ROTATED.replacen(
+                "function body(session){",
+                &format!("{mutation}function body(session){{"),
+                1,
+            );
+            if extract_shuffle_key(&changed).is_some() {
+                accepted.push(mutation);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "optional self-path mutations accepted: {accepted:?}"
+        );
+        for unrelated in [
+            "(window?.child).self[name]=replacement;",
+            "var obj={method:function(){(this?.self)[name]=replacement;}};",
+        ] {
+            assert_eq!(
+                extract_shuffle_key(&format!("{unrelated}\n{ROTATED}")),
+                Some(9_618_129)
+            );
+        }
     }
 }
