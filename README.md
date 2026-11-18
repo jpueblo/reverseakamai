@@ -5,6 +5,11 @@ Pure-Rust, sandbox-free SDK for Akamai Bot Manager web challenges (`bmak` v2/v3,
 > [!IMPORTANT]
 > **Need browser or mobile automation in production?** Static solvers break as script builds, VM opcodes, and mobile BMP/BAP SDKs rotate. [**Distilled**](https://distilled.cx) runs real ARM64 Android phones in the cloud with hardware-backed device identities, mobile proxies, and API, MCP and ADB control.
 
+## Build from source
+
+See [BUILDING.md](BUILDING.md) for conditional Windows x64, Windows ARM64 and
+Ubuntu 24.04 x64 builds, prerequisites and manual validation.
+
 ## Quickstart
 
 ```rust

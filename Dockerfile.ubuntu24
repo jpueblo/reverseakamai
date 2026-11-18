@@ -1,0 +1,19 @@
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    ca-certificates curl build-essential cmake ninja-build clang libclang-dev \
+    llvm-dev perl pkg-config git && rm -rf /var/lib/apt/lists/*
+ENV CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup
+ENV PATH="/opt/cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal --default-toolchain none
+WORKDIR /build
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+RUN rustup show active-toolchain
+COPY crates ./crates
+COPY vendor ./vendor
+COPY scripts ./scripts
+ARG PACKAGE=workspace
+RUN case "$PACKAGE" in codec|workspace) ;; *) echo "PACKAGE must be codec or workspace" >&2; exit 2 ;; esac; \
+    bash scripts/build.sh --package "$PACKAGE" --test
+CMD ["/build/target/x86_64-unknown-linux-gnu/release/akamai-codec", "--help"]
