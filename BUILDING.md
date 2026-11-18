@@ -100,7 +100,9 @@ but never execute examples or invoke the solver. With `--test` / `-Test`, they
 run library and binary unit tests. A native transport test uses only a numeric
 localhost HTTP server, disables proxies and bounds connection/read/write time.
 It checks native dependency linking and basic transport, not TLS negotiation or
-external website behavior. Private full-capture tests remain ignored by default.
+external website behavior. All normal tests use repository fixtures or synthetic
+inputs; no private-file environment variable is required. Private full-capture
+route checks belong to the separate offline corpus runner.
 
 Outputs are under `target/<target>/release` (or `debug`), unless
 `CARGO_TARGET_DIR` overrides the root. Build and test manually on each supported

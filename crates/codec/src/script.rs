@@ -472,22 +472,4 @@ mod tests {
         let ast = ast_scope::Analysis::parse(&source).unwrap();
         assert_eq!(extract_xor_with_budget(&ast, 100_000), Err(()));
     }
-    #[test]
-    #[ignore = "requires a private saved full source supplied explicitly"]
-    fn verify_saved_xor_capture() {
-        let path =
-            std::env::var("CODEC_PRIVATE_XOR_SCRIPT").expect("set private saved source path");
-        let source = std::fs::read_to_string(path).unwrap();
-        let ast = ast_scope::Analysis::parse(&source).unwrap();
-        assert!(delta_version::extract_with_analysis(&source, &ast).is_none());
-        let token = extract_xor_with_budget(&ast, XOR_WORK_BUDGET)
-            .expect("saved build stays within budget")
-            .expect("XOR version");
-        assert_eq!(extract_bmak_ver(&source), Some(token));
-        println!(
-            "saved full build: {} bytes, XOR fallback proven, budget {}",
-            source.len(),
-            XOR_WORK_BUDGET
-        );
-    }
 }
