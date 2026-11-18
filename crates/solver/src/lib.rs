@@ -5,6 +5,8 @@
 //! the v2/v3 `bmak` sensor via native Rust payload construction (`native-payload`
 //! + `akamai-codec`). Mobile BMP/BAP native SDKs are out of scope.
 
+#[cfg(test)]
+mod build_tests;
 mod detect;
 mod driver;
 pub mod env;
