@@ -38,6 +38,10 @@ pub(super) struct Numbers {
     values: HashMap<usize, i64>,
     arrays: HashMap<usize, Vec<Option<i64>>>,
     arguments: HashMap<usize, i64>,
+    // Values of write-once globals (declared without an initializer and
+    // assigned exactly once). Their write order cannot be proven, so they are
+    // kept apart from `values` and used only by the opaque-conversion route.
+    write_once: HashMap<usize, i64>,
     legacy: Option<BTreeMap<String, i64>>,
 }
 impl Numbers {
@@ -65,6 +69,11 @@ impl Numbers {
     pub fn array(&self, token: &str) -> Option<&Vec<Option<i64>>> {
         self.arrays.get(&(token.as_ptr() as usize))
     }
+    /// A proven constant, or else a write-once global constant.
+    pub fn get_write_once(&self, token: &str) -> Option<&i64> {
+        self.get(token)
+            .or_else(|| self.write_once.get(&(token.as_ptr() as usize)))
+    }
 }
 #[derive(Clone, Debug)]
 enum Use {
@@ -88,6 +97,8 @@ struct Binding {
     initial: Option<Value>,
     initialized: bool,
     function: bool,
+    parameter: bool,
+    implicit_initial_value: bool,
     function_escapes: bool,
     hoisted: bool,
     empty_array: bool,
@@ -97,10 +108,50 @@ struct Binding {
     global_var: bool,
     references: Vec<Reference>,
     non_computed_reads: Vec<u32>,
+    declared_init: bool,
+    plain_assignments: u32,
+    global_object_assignments: u32,
+    named_global_assignment: bool,
+    known_global_source: bool,
+    symbol_scope: Option<ScopeId>,
+    direct_member_written: bool,
 }
 impl Binding {
     fn stable(&self) -> bool {
         self.initialized && !self.redeclared && self.writes.is_empty() && !self.member_written
+    }
+    /// Declared without any initializer and written by exactly one plain `=`
+    /// assignment to the identifier itself (no compound, update, destructuring,
+    /// loop-target or member writes). Parameters already have incoming values
+    /// and cannot qualify. Flattened dispatchers assign rotated
+    /// constants and pools this way; the write's execution order is not proven.
+    fn write_once(&self) -> bool {
+        !self.declared_init
+            && !self.function
+            && !self.parameter
+            && !self.implicit_initial_value
+            && !self.redeclared
+            && !self.member_written
+            && self.writes.len() == 1
+            && self.plain_assignments == 1
+    }
+    /// Every write assigns the global object (`window`, `global`, `self`,
+    /// `globalThis` or `this`), with at least one real named-global write;
+    /// `this` alone does not establish global identity. A
+    /// direct member write or delete through the alias (`G[x]=...`) could
+    /// replace the opaque converter and rejects it; nested writes into objects
+    /// reached through the global (`G[x][y]=...`) are permitted.
+    fn global_object_alias(&self) -> bool {
+        !self.declared_init
+            && !self.function
+            && !self.parameter
+            && !self.implicit_initial_value
+            && !self.redeclared
+            && !self.direct_member_written
+            && !self.writes.is_empty()
+            && self.named_global_assignment
+            && self.writes.len() == self.plain_assignments as usize
+            && self.plain_assignments == self.global_object_assignments
     }
 }
 pub(super) struct Function {
@@ -116,6 +167,9 @@ pub(super) struct Initializer {
     pub simple: bool,
     pub callable: bool,
     pub seed_operator: bool,
+    /// `G[a](b[c](pool[index]))` where `a`, `b` and `c` are side-effect-free
+    /// opaque name expressions: the position of `G` and the span of the lookup.
+    pub conversion: Option<(u32, Span)>,
 }
 #[derive(Default)]
 pub(super) struct Analysis {
@@ -125,10 +179,13 @@ pub(super) struct Analysis {
     globals: HashMap<u32, String>,
     global_writes: HashSet<String>,
     global_members: HashSet<String>,
+    global_object_dirty: bool,
     scope_parents: HashMap<ScopeId, Option<ScopeId>>,
     subtract: HashSet<SymbolId>,
     pub functions: Vec<Function>,
-    pub key_pairs: Vec<(SymbolId, bool)>,
+    /// (key binding, lexically available, deferred closure read).
+    pub key_pairs: Vec<(SymbolId, bool, bool)>,
+    function_scopes: HashSet<ScopeId>,
     pub numbers: Numbers,
     pub initializers: Vec<Initializer>,
     pub unproven_key_writes: Vec<Span>,
@@ -236,6 +293,14 @@ impl Analysis {
             .filter_map(|(at, id)| derived.contains(id).then_some(*at))
             .collect()
     }
+    /// Sorted positions of reads of exactly the given bindings (no provenance).
+    pub fn owner_read_positions(&self, roots: impl IntoIterator<Item = SymbolId>) -> Vec<u32> {
+        let roots: HashSet<_> = roots.into_iter().collect();
+        self.reads
+            .iter()
+            .filter_map(|(at, id)| roots.contains(id).then_some(*at))
+            .collect()
+    }
     pub fn has_indexed_read(positions: &[u32], span: Span) -> bool {
         let index = positions.partition_point(|at| *at < span.start);
         positions.get(index).is_some_and(|at| *at < span.end)
@@ -287,9 +352,66 @@ impl Analysis {
             .is_some_and(|b| b.stable() && !b.function_escapes)
     }
     pub fn pool_intact_symbol(&self, id: SymbolId) -> bool {
-        self.bindings
-            .get(&id)
-            .is_some_and(|b| b.stable() && b.non_computed_reads.is_empty())
+        self.bindings.get(&id).is_some_and(|b| {
+            b.stable() && b.non_computed_reads.is_empty()
+                // A write-once pool's only non-computed reference is its own
+                // assignment target; every actual read must be an index read.
+                || b.write_once()
+                    && b
+                        .non_computed_reads
+                        .iter()
+                        .all(|at| b.writes.iter().any(|w| w.start == *at))
+        })
+    }
+    /// Pool binding usable by the opaque-conversion route: proven-stable, or a
+    /// write-once global whose single write created the pool.
+    pub fn write_once_or_stable(&self, token: &str) -> bool {
+        self.symbol(token)
+            .and_then(|id| self.bindings.get(&id))
+            .is_some_and(|b| (b.stable() || b.write_once()) && !b.function_escapes)
+    }
+    /// A read of a stable binding from inside a closure nested in the binding's
+    /// own function (with a function boundary between them). Such a read runs
+    /// when the closure is called, which may be after the initializer even if
+    /// the closure is written earlier. Order is not proven; a straight-line
+    /// read before the initializer in the same function is never deferred.
+    pub fn deferred_read(&self, id: SymbolId, at: u32) -> bool {
+        let Some(b) = self.bindings.get(&id) else {
+            return false;
+        };
+        let (Some(home), Some((_, mut scope))) =
+            (b.symbol_scope, self.identifiers.get(&at).copied())
+        else {
+            return false;
+        };
+        if !b.stable() || b.function_escapes || !self.descendant(scope, home) {
+            return false;
+        }
+        while scope != home {
+            if self.function_scopes.contains(&scope) {
+                return true;
+            }
+            let Some(Some(parent)) = self.scope_parents.get(&scope) else {
+                return false;
+            };
+            scope = *parent;
+        }
+        false
+    }
+    /// The identifier at `at` resolves to a global-object alias binding.
+    pub fn global_object_alias_at(&self, at: u32) -> bool {
+        !self.global_object_dirty
+            && !self.poisoned.contains(&at)
+            && self
+                .identifiers
+                .get(&at)
+                .and_then(|(id, _)| self.bindings.get(id))
+                .is_some_and(Binding::global_object_alias)
+    }
+    /// Number of reads of the given (sorted) positions inside `span`.
+    pub fn indexed_reads_in(positions: &[u32], span: Span) -> usize {
+        positions.partition_point(|at| *at < span.end)
+            - positions.partition_point(|at| *at < span.start)
     }
     pub fn builtin(&self, token: &str, name: &str) -> bool {
         self.offset(token)
@@ -395,6 +517,11 @@ struct Builder<'s, 'a> {
     helpers: HashMap<SymbolId, (&'static str, SymbolId)>,
     memo: HashMap<SymbolId, Option<Value>>,
     visiting: HashSet<SymbolId>,
+    // Right-hand side of each identifier's plain assignment (meaningful only
+    // for write-once bindings) and the separate write-once evaluation mode.
+    assigned: HashMap<SymbolId, &'a Expression<'a>>,
+    allow_write_once: bool,
+    write_once_memo: HashMap<SymbolId, Option<Value>>,
 }
 impl<'s, 'a> Builder<'s, 'a> {
     fn new(source: &'s str, semantic: &'s Semantic<'a>) -> Self {
@@ -408,10 +535,12 @@ impl<'s, 'a> Builder<'s, 'a> {
                 globals: HashMap::default(),
                 global_writes: HashSet::default(),
                 global_members: HashSet::default(),
+                global_object_dirty: false,
                 scope_parents: HashMap::default(),
                 subtract: HashSet::default(),
                 functions: Vec::new(),
                 key_pairs: Vec::new(),
+                function_scopes: HashSet::default(),
                 numbers: Numbers::default(),
                 initializers: Vec::new(),
                 unproven_key_writes: Vec::new(),
@@ -430,7 +559,149 @@ impl<'s, 'a> Builder<'s, 'a> {
             helpers: HashMap::default(),
             memo: HashMap::default(),
             visiting: HashSet::default(),
+            assigned: HashMap::default(),
+            allow_write_once: false,
+            write_once_memo: HashMap::default(),
         }
+    }
+    fn global_object(&self, e: &Expression<'a>) -> bool {
+        match e.get_inner_expression() {
+            Expression::ThisExpression(_) => true,
+            Expression::Identifier(i) => {
+                matches!(i.name.as_str(), "window" | "global" | "self" | "globalThis")
+                    && i.reference_id.get().is_some_and(|r| {
+                        self.semantic
+                            .scoping()
+                            .get_reference(r)
+                            .symbol_id()
+                            .is_none()
+                    })
+            }
+            _ => false,
+        }
+    }
+    // Mutation tracking also covers declaration-initialized writer aliases.
+    // A local method's `H=this` does not prove that H refers to the global.
+    fn known_global_source(&self, e: &Expression<'a>, id: NodeId) -> bool {
+        let Some(root) = Self::global_path_root(e) else {
+            return false;
+        };
+        // Only direct named globals or lexical global `this` establish source
+        // facts here; never follow another binding during this collection pass.
+        self.global_object(root)
+            && (!matches!(root, Expression::ThisExpression(_)) || self.global_this(id))
+    }
+    /// Side-effect-free expression that only computes a property name or a
+    /// receiver: references, literals, calls, member reads, `typeof`/`!`/unary
+    /// `+`/`-`, equality, `+` and conditionals. Assignments, updates, `delete`,
+    /// functions, `new`, sequences, spreads and templates are rejected.
+    fn opaque_name(e: &Expression<'a>, budget: &mut usize, depth: usize) -> bool {
+        if depth > 48 {
+            return false;
+        }
+        let Some(left) = budget.checked_sub(1) else {
+            return false;
+        };
+        *budget = left;
+        let next = depth + 1;
+        match e.get_inner_expression() {
+            Expression::Identifier(_)
+            | Expression::StringLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::ThisExpression(_) => true,
+            Expression::ObjectExpression(o) => o.properties.is_empty(),
+            Expression::ArrayExpression(a) => a.elements.iter().all(|element| {
+                element
+                    .as_expression()
+                    .is_some_and(|x| Self::opaque_name(x, budget, next))
+            }),
+            Expression::UnaryExpression(u) => {
+                matches!(u.operator.as_str(), "typeof" | "!" | "+" | "-" | "void")
+                    && Self::opaque_name(&u.argument, budget, next)
+            }
+            Expression::BinaryExpression(b) => {
+                matches!(b.operator.as_str(), "===" | "!==" | "==" | "!=" | "+")
+                    && Self::opaque_name(&b.left, budget, next)
+                    && Self::opaque_name(&b.right, budget, next)
+            }
+            Expression::ConditionalExpression(c) => {
+                Self::opaque_name(&c.test, budget, next)
+                    && Self::opaque_name(&c.consequent, budget, next)
+                    && Self::opaque_name(&c.alternate, budget, next)
+            }
+            Expression::CallExpression(c) => {
+                !c.optional
+                    && Self::opaque_name(&c.callee, budget, next)
+                    && c.arguments.iter().all(|argument| {
+                        argument
+                            .as_expression()
+                            .is_some_and(|x| Self::opaque_name(x, budget, next))
+                    })
+            }
+            Expression::StaticMemberExpression(m) => {
+                !m.optional && Self::opaque_name(&m.object, budget, next)
+            }
+            Expression::ComputedMemberExpression(m) => {
+                !m.optional
+                    && Self::opaque_name(&m.object, budget, next)
+                    && Self::opaque_name(&m.expression, budget, next)
+            }
+            _ => false,
+        }
+    }
+    /// Recognize `G[a](b[c](pool[index]))`. Returns the position of `G` and the
+    /// span of `pool[index]`. Whether `G` is a global-object alias, and whether
+    /// the pool and index qualify, is decided by the numeric recognizer.
+    fn conversion_shape(init: &Expression<'a>) -> Option<(u32, Span)> {
+        fn single_call<'b, 'c>(
+            e: &'b Expression<'c>,
+        ) -> Option<(&'b ComputedMemberExpression<'c>, &'b Expression<'c>)> {
+            let Expression::CallExpression(c) = e.get_inner_expression() else {
+                return None;
+            };
+            if c.optional || c.arguments.len() != 1 {
+                return None;
+            }
+            let Expression::ComputedMemberExpression(m) = c.callee.get_inner_expression() else {
+                return None;
+            };
+            if m.optional {
+                return None;
+            }
+            Some((m, c.arguments[0].as_expression()?.get_inner_expression()))
+        }
+        let mut budget = 4_096usize;
+        let (outer, argument) = single_call(init)?;
+        let Expression::Identifier(global) = outer.object.get_inner_expression() else {
+            return None;
+        };
+        if !Self::opaque_name(&outer.expression, &mut budget, 0) {
+            return None;
+        }
+        let (inner, lookup) = single_call(argument)?;
+        if !Self::opaque_name(&inner.object, &mut budget, 0)
+            || !Self::opaque_name(&inner.expression, &mut budget, 0)
+        {
+            return None;
+        }
+        let Expression::ComputedMemberExpression(read) = lookup else {
+            return None;
+        };
+        if read.optional
+            || !matches!(
+                read.object.get_inner_expression(),
+                Expression::Identifier(_)
+            )
+            || !matches!(
+                read.expression.get_inner_expression(),
+                Expression::Identifier(_) | Expression::NumericLiteral(_)
+            )
+        {
+            return None;
+        }
+        Some((global.span.start, read.span))
     }
     fn block(&self, id: NodeId) -> Option<NodeId> {
         let member = self.parent(id);
@@ -525,6 +796,7 @@ impl<'s, 'a> Builder<'s, 'a> {
         for parent in self.semantic.nodes().ancestor_ids(id) {
             match self.semantic.nodes().kind(parent) {
                 AstKind::ParenthesizedExpression(_)
+                | AstKind::ChainExpression(_)
                 | AstKind::ArrayAssignmentTarget(_)
                 | AstKind::ObjectAssignmentTarget(_)
                 | AstKind::AssignmentTargetRest(_)
@@ -549,6 +821,69 @@ impl<'s, 'a> Builder<'s, 'a> {
             }
         }
         false
+    }
+    // Arrows, class heritage and computed class keys inherit outer `this`.
+    // Ordinary functions/methods, field values and static blocks bind it.
+    fn global_this(&self, id: NodeId) -> bool {
+        let at = self.semantic.nodes().kind(id).span();
+        let contains = |span: Span| span.start <= at.start && at.end <= span.end;
+        for node in self.semantic.nodes().ancestors(id) {
+            match node.kind() {
+                AstKind::Function(_) | AstKind::StaticBlock(_) => return false,
+                AstKind::PropertyDefinition(p)
+                    if p.value.as_ref().is_some_and(|e| contains(e.span())) =>
+                {
+                    return false;
+                }
+                AstKind::AccessorProperty(p)
+                    if p.value.as_ref().is_some_and(|e| contains(e.span())) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+    // Normalize only static self-reference properties and optional member
+    // wrappers. Each iteration consumes an AST object path member, without
+    // recursion, name evaluation or general alias propagation.
+    fn global_path_root<'b>(mut e: &'b Expression<'a>) -> Option<&'b Expression<'a>> {
+        loop {
+            e = e.get_inner_expression();
+            if matches!(e, Expression::Identifier(_) | Expression::ThisExpression(_)) {
+                return Some(e);
+            }
+            let member = e.get_member_expr()?;
+            if !member.static_property_name().is_some_and(|name| {
+                matches!(
+                    name.as_str(),
+                    Some("window" | "self" | "globalThis" | "global")
+                )
+            }) {
+                return None;
+            }
+            e = member.object();
+        }
+    }
+    // The member pass runs after source facts have been collected. It may
+    // recognize a known alias root, unlike source collection above.
+    fn global_receiver(&self, e: &Expression<'a>, id: NodeId) -> bool {
+        let Some(root) = Self::global_path_root(e) else {
+            return false;
+        };
+        match root {
+            Expression::Identifier(r) => {
+                self.global_object(root)
+                    || r.reference_id
+                        .get()
+                        .and_then(|r| self.semantic.scoping().get_reference(r).symbol_id())
+                        .and_then(|symbol| self.out.bindings.get(&symbol))
+                        .is_some_and(|fact| fact.known_global_source)
+            }
+            Expression::ThisExpression(_) => self.global_this(id),
+            _ => false,
+        }
     }
     fn root<'b>(&self, mut e: &'b Expression<'a>) -> &'b Expression<'a> {
         loop {
@@ -624,6 +959,9 @@ impl<'s, 'a> Builder<'s, 'a> {
             self.out
                 .scope_parents
                 .insert(scope, scoping.scope_parent_id(scope));
+            if scoping.scope_flags(scope).is_function() {
+                self.out.function_scopes.insert(scope);
+            }
         }
         for node in self.semantic.nodes().iter() {
             if let AstKind::Function(f) = node.kind() {
@@ -654,6 +992,40 @@ impl<'s, 'a> Builder<'s, 'a> {
                 Binding {
                     redeclared: !scoping.symbol_redeclarations(id).is_empty(),
                     global_var,
+                    parameter: scoping.symbol_flags(id).is_catch_variable()
+                        || matches!(
+                            self.semantic.nodes().kind(scoping.symbol_declaration(id)),
+                            AstKind::FormalParameter(_) | AstKind::FormalParameterRest(_)
+                        )
+                        || matches!(
+                            self.semantic.nodes().kind(scoping.symbol_declaration(id)),
+                            AstKind::BindingRestElement(_)
+                        ) && matches!(
+                            self.semantic.nodes().kind(
+                                self.semantic
+                                    .nodes()
+                                    .parent_id(scoping.symbol_declaration(id))
+                            ),
+                            AstKind::FormalParameters(_)
+                        ),
+                    // Loop-head declarations receive implicit iteration values;
+                    // function/class self-names already hold their definition.
+                    implicit_initial_value: scoping.symbol_flags(id).is_function()
+                        || scoping.symbol_flags(id).is_class()
+                        || matches!(
+                            self.semantic.nodes().kind(scoping.symbol_declaration(id)),
+                            AstKind::VariableDeclarator(_)
+                        ) && matches!(
+                            self.semantic.nodes().kind(
+                                self.semantic.nodes().parent_id(
+                                    self.semantic
+                                        .nodes()
+                                        .parent_id(scoping.symbol_declaration(id))
+                                )
+                            ),
+                            AstKind::ForInStatement(_) | AstKind::ForOfStatement(_)
+                        ),
+                    symbol_scope: Some(scoping.symbol_scope_id(id)),
                     ..Binding::default()
                 },
             );
@@ -672,7 +1044,7 @@ impl<'s, 'a> Builder<'s, 'a> {
                                     && b.span.end <= d.id.span().end
                                 {
                                     if let Some(init) = &d.init {
-                                        self.out.initializers.push(Initializer{symbol:id,binding:b.span,expression:if matches!(d.id,BindingPattern::BindingIdentifier(_)){init.span()}else{d.span},simple:matches!(d.id,BindingPattern::BindingIdentifier(_)),callable:matches!(init.get_inner_expression(),Expression::FunctionExpression(_)|Expression::ArrowFunctionExpression(_)),seed_operator:matches!(init.get_inner_expression(),Expression::UnaryExpression(u) if matches!(u.operator.as_str(),"-"|"!"|"~"))});
+                                        self.out.initializers.push(Initializer{symbol:id,binding:b.span,expression:if matches!(d.id,BindingPattern::BindingIdentifier(_)){init.span()}else{d.span},simple:matches!(d.id,BindingPattern::BindingIdentifier(_)),callable:matches!(init.get_inner_expression(),Expression::FunctionExpression(_)|Expression::ArrowFunctionExpression(_)),seed_operator:matches!(init.get_inner_expression(),Expression::UnaryExpression(u) if matches!(u.operator.as_str(),"-"|"!"|"~")),conversion:if matches!(d.id,BindingPattern::BindingIdentifier(_)){Self::conversion_shape(init)}else{None}});
                                     }
                                     break;
                                 }
@@ -684,8 +1056,14 @@ impl<'s, 'a> Builder<'s, 'a> {
                     if let BindingPattern::BindingIdentifier(b) = &d.id {
                         let id = b.symbol_id.get()?;
                         let direct = self.direct_initializer(node.id());
+                        let global_source = d
+                            .init
+                            .as_ref()
+                            .is_some_and(|e| self.known_global_source(e, node.id()));
                         let fact = self.out.bindings.get_mut(&id)?;
+                        fact.known_global_source |= global_source;
                         if let Some(init) = &d.init {
+                            fact.declared_init = true;
                             fact.initialized = direct;
                             fact.init_scope = Some(node.scope_id());
                             fact.init_end = init.span().end;
@@ -699,14 +1077,27 @@ impl<'s, 'a> Builder<'s, 'a> {
                 }
                 AstKind::AssignmentExpression(a) => {
                     if let AssignmentTarget::AssignmentTargetIdentifier(reference) = &a.left {
-                        if let (Some(symbol), Some(array)) = (
-                            reference
-                                .reference_id
-                                .get()
-                                .and_then(|r| scoping.get_reference(r).symbol_id()),
-                            Self::pool_array(&a.right),
-                        ) {
+                        let symbol = reference
+                            .reference_id
+                            .get()
+                            .and_then(|r| scoping.get_reference(r).symbol_id());
+                        if let (Some(symbol), Some(array)) = (symbol, Self::pool_array(&a.right)) {
                             self.out.pool_owners.push((symbol, array));
+                        }
+                        if let Some(symbol) = symbol.filter(|_| a.operator.as_str() == "=") {
+                            let global = self.global_object(&a.right);
+                            let global_source = self.known_global_source(&a.right, node.id());
+                            self.assigned.insert(symbol, &a.right);
+                            let fact = self.out.bindings.get_mut(&symbol)?;
+                            fact.plain_assignments += 1;
+                            fact.known_global_source |= global_source;
+                            if global {
+                                fact.global_object_assignments += 1;
+                                fact.named_global_assignment |= matches!(
+                                    a.right.get_inner_expression(),
+                                    Expression::Identifier(_)
+                                );
+                            }
                         }
                     }
                 }
@@ -871,6 +1262,12 @@ impl<'s, 'a> Builder<'s, 'a> {
                         }
                         if reference.is_write() {
                             self.out.global_writes.insert(r.name.to_string());
+                            // Identifier replacement is distinct from a nested
+                            // object's same-named property write.
+                            self.out.global_object_dirty |= matches!(
+                                r.name.as_str(),
+                                "window" | "global" | "self" | "globalThis"
+                            );
                         }
                     }
                 }
@@ -904,6 +1301,11 @@ impl<'s, 'a> Builder<'s, 'a> {
                 continue;
             }
 
+            // A direct property replacement through a real global name can
+            // replace the opaque converter just as a write through its alias
+            // can. Nested object writes do not replace global properties.
+            let direct_global = self.global_receiver(member.object(), node.id());
+            self.out.global_object_dirty |= direct_global;
             match root {
                 Expression::Identifier(r) => {
                     let symbol = r
@@ -911,7 +1313,13 @@ impl<'s, 'a> Builder<'s, 'a> {
                         .get()
                         .and_then(|id| scoping.get_reference(id).symbol_id());
                     if let Some(id) = symbol {
-                        self.out.bindings.get_mut(&id)?.member_written = true;
+                        let direct = matches!(
+                            member.object().get_inner_expression(),
+                            Expression::Identifier(_)
+                        );
+                        let fact = self.out.bindings.get_mut(&id)?;
+                        fact.member_written = true;
+                        fact.direct_member_written |= direct;
                     } else {
                         let name = r.name.as_str();
                         self.out.global_members.insert(name.to_owned());
@@ -939,8 +1347,16 @@ impl<'s, 'a> Builder<'s, 'a> {
             let fact = self.out.bindings.get_mut(&id)?;
             if fact.global_var && self.out.global_writes.contains(scoping.symbol_name(id)) {
                 fact.member_written = true;
+                fact.direct_member_written = true;
             }
         }
+        // Aliases share one global object: replacing a converter through a
+        // different known alias also invalidates the alias used by the chain.
+        self.out.global_object_dirty |= self
+            .out
+            .bindings
+            .values()
+            .any(|fact| fact.known_global_source && fact.direct_member_written);
         for fact in self.out.bindings.values_mut() {
             fact.references
                 .sort_unstable_by_key(|reference| reference.at);
@@ -1051,12 +1467,14 @@ impl<'s, 'a> Builder<'s, 'a> {
                             .get()
                             .and_then(|r| scoping.get_reference(r).symbol_id())
                         {
+                            let deferred = self.out.deferred_read(symbol, reference.span.start);
                             self.out.key_pairs.push((
                                 symbol,
                                 self.out.available(
                                     &self.source[reference.span.start as usize
                                         ..reference.span.end as usize],
                                 ),
+                                deferred,
                             ));
                         }
                     }
@@ -1081,7 +1499,22 @@ impl<'s, 'a> Builder<'s, 'a> {
                     .insert(self.out.base + a.span.start as usize, numbers);
             }
         }
-        let key_ids: HashSet<_> = self.out.key_pairs.iter().map(|(id, _)| *id).collect();
+        // Write-once constants: evaluated in a separate mode with its own memo,
+        // so they never leak into proven values or the proven-value memo.
+        self.allow_write_once = true;
+        for node in self.semantic.nodes().iter() {
+            if let AstKind::IdentifierReference(i) = node.kind() {
+                let address = self.out.base + i.span.start as usize;
+                if self.out.numbers.values.contains_key(&address) {
+                    continue;
+                }
+                if let Some(Value::Number(n)) = self.reference_value(i, 0) {
+                    self.out.numbers.write_once.insert(address, n);
+                }
+            }
+        }
+        self.allow_write_once = false;
+        let key_ids: HashSet<_> = self.out.key_pairs.iter().map(|(id, _, _)| *id).collect();
         let mut global_pairs = HashSet::default();
         for node in self.semantic.nodes().iter() {
             if let AstKind::ArrayExpression(a) = node.kind() {
@@ -1218,6 +1651,26 @@ impl<'s, 'a> Builder<'s, 'a> {
         if depth > 32 {
             return None;
         }
+        if self.allow_write_once {
+            if let Some(v) = self.write_once_memo.get(&id) {
+                return *v;
+            }
+            if !self.visiting.insert(id) {
+                return None;
+            }
+            let binding = self.out.bindings.get(&id);
+            let source = if binding.is_some_and(Binding::stable) {
+                self.inits.get(&id).copied()
+            } else if binding.is_some_and(Binding::write_once) {
+                self.assigned.get(&id).copied()
+            } else {
+                None
+            };
+            let value = source.and_then(|e| self.expr(e, depth + 1));
+            self.visiting.remove(&id);
+            self.write_once_memo.insert(id, value);
+            return value;
+        }
         if let Some(v) = self.memo.get(&id) {
             return *v;
         }
@@ -1259,7 +1712,12 @@ impl<'s, 'a> Builder<'s, 'a> {
             return None;
         }
         let scope = self.out.identifiers.get(&i.span.start)?.1;
-        if !self.out.available_at(id, i.span.start, scope) {
+        // Only an assigned-once binding has intentionally unproven ordering.
+        // Normal initialized bindings keep their availability check even when
+        // evaluated as dependencies of an assigned-once constant.
+        let assigned_once =
+            self.allow_write_once && self.out.bindings.get(&id).is_some_and(Binding::write_once);
+        if !assigned_once && !self.out.available_at(id, i.span.start, scope) {
             return None;
         }
         self.symbol_value(id, depth)
