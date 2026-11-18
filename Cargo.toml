@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
-native-payload = { git = "https://github.com/9xz/native-payload" }
+native-payload = { path = "vendor/native-payload" }
 wreq = { version = "0.16.1", features = ["gzip", "brotli", "deflate", "zstd", "cookies"] }
 wreq-util = { git = "https://github.com/0x676e67/wreq-util", rev = "917d2581d6761a94db66466caa6c2eb4d4cdbd43" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
